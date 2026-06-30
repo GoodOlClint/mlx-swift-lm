@@ -151,15 +151,30 @@ public class Qwen3ModelInner: Module {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        forward(inputs, cache: cache, captureLayers: nil).hidden
+    }
+
+    /// Forward pass that optionally captures the post-block hidden state at each
+    /// index in `captureLayers` (for DSpark multi-layer context injection).
+    ///
+    /// `captureLayers == nil` is the default path and is byte-identical to the
+    /// bare ``callAsFunction(_:cache:)`` — no extra work, no captured dict.
+    func forward(_ inputs: MLXArray, cache: [KVCache]? = nil, captureLayers: Set<Int>?)
+        -> (hidden: MLXArray, captured: [Int: MLXArray])
+    {
         var h = embedTokens(inputs)
 
         let mask = createAttentionMask(h: h, cache: cache?.first)
 
+        var captured: [Int: MLXArray] = [:]
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: cache?[i])
+            if captureLayers?.contains(i) == true {
+                captured[i] = h
+            }
         }
 
-        return norm(h)
+        return (norm(h), captured)
     }
 }
 
@@ -191,6 +206,32 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
             out = model.embedTokens.asLinear(out)
         }
         return out
+    }
+
+    /// MTP-aware entry point. When a DSpark drafter sets ``mtpEmitFlagKey`` and
+    /// ``mtpCaptureLayersKey`` on the incoming state, the returned ``LMOutput``
+    /// carries ``mtpLayerHiddenStatesKey`` (hiddens at the requested layers) and
+    /// ``mtpLastHiddenStatesKey`` (the final post-norm hidden / anchor). With the
+    /// flag or capture-layers absent, this is bit-identical to the default
+    /// ``LanguageModel`` implementation, so non-DSpark generation is unaffected.
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        let emit = state?[mtpEmitFlagKey] ?? false
+        guard emit, let captureLayers = state?[mtpCaptureLayersKey], !captureLayers.isEmpty
+        else {
+            // Default path — must match LanguageModel's default exactly.
+            return .init(logits: callAsFunction(input.tokens, cache: cache))
+        }
+
+        let (hidden, captured) = model.forward(
+            input.tokens, cache: cache, captureLayers: Set(captureLayers))
+        let logits = lmHead.map { $0(hidden) } ?? model.embedTokens.asLinear(hidden)
+
+        var out = state ?? LMOutput.State()
+        out[mtpLayerHiddenStatesKey] = captured
+        out[mtpLastHiddenStatesKey] = hidden
+        return .init(logits: logits, state: out)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
