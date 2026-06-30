@@ -59,6 +59,58 @@ public struct Qwen3DSparkConfiguration: Sendable {
     }
 }
 
+extension Qwen3DSparkConfiguration: Decodable {
+    private enum CodingKeys: String, CodingKey {
+        case hiddenSize = "hidden_size"
+        case vocabSize = "vocab_size"
+        case numHiddenLayers = "num_hidden_layers"
+        case numAttentionHeads = "num_attention_heads"
+        case numKeyValueHeads = "num_key_value_heads"
+        case headDim = "head_dim"
+        case intermediateSize = "intermediate_size"
+        case rmsNormEps = "rms_norm_eps"
+        case ropeTheta = "rope_theta"
+        case ropeParameters = "rope_parameters"
+        case targetLayerIds = "target_layer_ids"
+        case blockSize = "block_size"
+        case markovRank = "markov_rank"
+        case maskTokenId = "mask_token_id"
+        case maxPositionEmbeddings = "max_position_embeddings"
+    }
+
+    private struct RopeParameters: Decodable {
+        let ropeTheta: Float?
+        private enum CodingKeys: String, CodingKey { case ropeTheta = "rope_theta" }
+    }
+
+    public init(from decoder: any Swift.Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // `rope_theta` may be top-level (older configs) or nested under
+        // `rope_parameters` (Qwen3DSpark checkpoints).
+        let ropeTheta =
+            (try? c.decode(Float.self, forKey: .ropeTheta))
+            ?? ((try? c.decode(RopeParameters.self, forKey: .ropeParameters))?.ropeTheta)
+            ?? 1_000_000
+        self.init(
+            hiddenSize: try c.decode(Int.self, forKey: .hiddenSize),
+            vocabSize: try c.decode(Int.self, forKey: .vocabSize),
+            numHiddenLayers: try c.decode(Int.self, forKey: .numHiddenLayers),
+            numAttentionHeads: try c.decode(Int.self, forKey: .numAttentionHeads),
+            numKeyValueHeads: try c.decode(Int.self, forKey: .numKeyValueHeads),
+            headDim: try c.decode(Int.self, forKey: .headDim),
+            intermediateSize: try c.decode(Int.self, forKey: .intermediateSize),
+            rmsNormEps: try c.decode(Float.self, forKey: .rmsNormEps),
+            ropeTheta: ropeTheta,
+            targetLayerIds: try c.decode([Int].self, forKey: .targetLayerIds),
+            blockSize: try c.decode(Int.self, forKey: .blockSize),
+            markovRank: try c.decode(Int.self, forKey: .markovRank),
+            maskTokenId: try c.decode(Int.self, forKey: .maskTokenId),
+            maxPositionEmbeddings: try c.decodeIfPresent(
+                Int.self, forKey: .maxPositionEmbeddings) ?? 40960
+        )
+    }
+}
+
 // MARK: - Attention with target-context KV injection (Eq. 3)
 
 final class Qwen3DSparkAttention: Module {
@@ -209,6 +261,13 @@ public final class Qwen3DSparkModel: Module {
 
     public func logits(_ h: MLXArray) -> MLXArray { lmHead(h) }
 
+    /// Drop checkpoint weights for components this v1 doesn't model — the
+    /// confidence head (deferred; fixed-length verify is lossless). Keeps
+    /// `update(verify: [.all])` from failing on unmodeled keys.
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        weights.filter { !$0.key.hasPrefix("confidence_head") }
+    }
+
     /// Sequential greedy Markov sampling (temp 0) over a block of `base` logits
     /// `[B, block, V]`, seeded by the `anchor` token `[B]`. Returns `[B, block]`.
     public func markovSampleGreedy(base: MLXArray, anchor: MLXArray) -> MLXArray {
@@ -250,5 +309,39 @@ extension Qwen3DSparkModel: DSparkDrafting {
         let hidden = backbone(noiseEmbedding: noiseEmb, targetHidden: context, mask: .array(mask))
         let base = logits(hidden)
         return markovSampleGreedy(base: base, anchor: bonus2.reshaped(B))
+    }
+}
+
+// MARK: - Loading + target pairing
+
+public enum Qwen3DSparkDrafter {
+    /// Seeded target-model-id → DSpark drafter-id map, from DeepSpec's released
+    /// checkpoints. The target config doesn't advertise its drafter, so — like
+    /// the Gemma 4 assistant — pairing is explicit (not sniffed in-config).
+    public static let drafterForTarget: [String: String] = [
+        "Qwen/Qwen3-4B": "deepseek-ai/dspark_qwen3_4b_block7",
+        "Qwen/Qwen3-8B": "deepseek-ai/dspark_qwen3_8b_block7",
+        "Qwen/Qwen3-14B": "deepseek-ai/dspark_qwen3_14b_block7",
+    ]
+
+    /// Load a DSpark drafter from a checkpoint directory (`config.json` +
+    /// `*.safetensors`). `sanitize` drops the deferred confidence head so
+    /// `verify: [.all]` doesn't fail on the unmodeled keys.
+    public static func load(directory: URL) throws -> Qwen3DSparkModel {
+        let configURL = directory.appending(component: "config.json")
+        let cfg = try JSONDecoder().decode(
+            Qwen3DSparkConfiguration.self, from: Data(contentsOf: configURL))
+        let model = Qwen3DSparkModel(cfg)
+
+        var weights: [String: MLXArray] = [:]
+        let enumerator = FileManager.default.enumerator(
+            at: directory, includingPropertiesForKeys: nil)!
+        for case let url as URL in enumerator where url.pathExtension == "safetensors" {
+            for (k, v) in try loadArrays(url: url) { weights[k] = v }
+        }
+        weights = model.sanitize(weights: weights)
+        try model.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+        eval(model)
+        return model
     }
 }

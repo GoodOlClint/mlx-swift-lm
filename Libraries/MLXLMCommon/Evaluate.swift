@@ -1739,6 +1739,83 @@ public func generateTokens(
     return stream
 }
 
+/// Generates a stream using DSpark semi-autoregressive speculative decoding.
+///
+/// Parallels ``generate(input:cache:parameters:context:mtpDrafter:blockSize:wiredMemoryTicket:)``
+/// but for ``DSparkDrafting`` drafters, which condition on the target's
+/// multi-layer hidden states over the whole prefix (accumulated by the
+/// iterator) rather than a single per-round hidden + shared K/V.
+///
+/// - Parameters:
+///   - dsparkDrafter: the DSpark drafter (e.g. `Qwen3DSparkModel`). Stateless
+///     wrt the accumulated context, which the iterator owns and threads in.
+///   - blockSize: total tokens per round; defaults to the drafter's own
+///     `blockSize` (the checkpoint's `block_size`).
+public func generate(
+    input: LMInput,
+    cache: [KVCache]? = nil,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    dsparkDrafter: any DSparkDrafting,
+    blockSize: Int? = nil,
+    wiredMemoryTicket: WiredMemoryTicket? = nil
+) throws -> AsyncStream<Generation> {
+    let iterator = try DSparkTokenIterator(
+        input: input,
+        mainModel: context.model,
+        drafter: dsparkDrafter,
+        mainCache: cache,
+        parameters: parameters,
+        blockSize: blockSize
+    )
+    let (stream, _) = generateLoopTask(
+        promptTokenCount: input.text.tokens.size,
+        modelConfiguration: context.configuration,
+        tokenizer: context.tokenizer,
+        iterator: iterator,
+        wiredMemoryTicket: wiredMemoryTicket,
+        handler: TextToolTokenLoopHandler(
+            tokenizer: context.tokenizer,
+            stopStrings: context.configuration.effectiveStopStrings,
+            format: context.configuration.toolCallFormat ?? .json
+        )
+    )
+    return stream
+}
+
+/// Generates raw token IDs asynchronously using DSpark speculative decoding.
+///
+/// Parallels
+/// ``generate(input:cache:parameters:context:dsparkDrafter:blockSize:wiredMemoryTicket:)``
+/// but yields raw token IDs.
+public func generateTokens(
+    input: LMInput,
+    cache: [KVCache]? = nil,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    dsparkDrafter: any DSparkDrafting,
+    blockSize: Int? = nil,
+    wiredMemoryTicket: WiredMemoryTicket? = nil
+) throws -> AsyncStream<TokenGeneration> {
+    let iterator = try DSparkTokenIterator(
+        input: input,
+        mainModel: context.model,
+        drafter: dsparkDrafter,
+        mainCache: cache,
+        parameters: parameters,
+        blockSize: blockSize
+    )
+    let (stream, _) = generateLoopTask(
+        promptTokenCount: input.text.tokens.size,
+        modelConfiguration: context.configuration,
+        tokenizer: context.tokenizer,
+        iterator: iterator,
+        wiredMemoryTicket: wiredMemoryTicket,
+        handler: RawTokenLoopHandler()
+    )
+    return stream
+}
+
 /// Generates raw token IDs asynchronously and returns the stream plus a `Task`.
 ///
 /// Prefer this overload if you want to be able to observe when the underlying generation work is finished

@@ -91,3 +91,78 @@ func testQwen3DSparkParityVsDeepSpecReference() throws {
             .item(Bool.self),
         "Markov greedy token sequence mismatch")
 }
+
+// MARK: - Config decoding
+
+@Test
+func testQwen3DSparkConfigDecodesRealShape() throws {
+    // Representative of deepseek-ai/dspark_qwen3_4b_block7/config.json, incl. the
+    // nested rope_parameters that the decoder must flatten to ropeTheta.
+    let json = """
+        {
+          "architectures": ["Qwen3DSparkModel"],
+          "block_size": 7, "head_dim": 128, "hidden_size": 2560,
+          "intermediate_size": 9728, "markov_rank": 256, "mask_token_id": 151669,
+          "max_position_embeddings": 40960, "model_type": "qwen3",
+          "num_attention_heads": 32, "num_hidden_layers": 5,
+          "num_key_value_heads": 8, "rms_norm_eps": 1e-06,
+          "rope_parameters": {"rope_theta": 1000000, "rope_type": "default"},
+          "target_layer_ids": [1, 9, 17, 25, 33], "vocab_size": 151936
+        }
+        """
+    let cfg = try JSONDecoder().decode(Qwen3DSparkConfiguration.self, from: Data(json.utf8))
+    #expect(cfg.hiddenSize == 2560)
+    #expect(cfg.vocabSize == 151936)
+    #expect(cfg.numHiddenLayers == 5)
+    #expect(cfg.numKeyValueHeads == 8)
+    #expect(cfg.headDim == 128)
+    #expect(cfg.targetLayerIds == [1, 9, 17, 25, 33])
+    #expect(cfg.blockSize == 7)
+    #expect(cfg.markovRank == 256)
+    #expect(cfg.maskTokenId == 151669)
+    #expect(cfg.ropeTheta == 1_000_000)  // flattened from rope_parameters
+}
+
+// MARK: - Loader + pairing
+
+@Test
+func testQwen3DSparkLoaderRoundTripsAndSanitizes() throws {
+    let cfg = Qwen3DSparkConfiguration(
+        hiddenSize: 8, vocabSize: 16, numHiddenLayers: 1, numAttentionHeads: 2,
+        numKeyValueHeads: 1, headDim: 4, intermediateSize: 16, rmsNormEps: 1e-6,
+        ropeTheta: 1e6, targetLayerIds: [0, 1], blockSize: 3, markovRank: 4,
+        maskTokenId: 15, maxPositionEmbeddings: 64)
+    let model = Qwen3DSparkModel(cfg)
+    eval(model)
+
+    // The model's own params form a valid checkpoint; add an unmodeled
+    // confidence_head key that the loader's sanitize MUST drop (else
+    // `verify: [.all]` would throw on the unexpected key → load fails).
+    var weights = [String: MLXArray]()
+    for (k, v) in model.parameters().flattened() { weights[k] = v }
+    weights["confidence_head.proj.weight"] = MLXArray.zeros([1, cfg.hiddenSize + cfg.markovRank])
+    weights["confidence_head.proj.bias"] = MLXArray.zeros([1])
+
+    let dir = FileManager.default.temporaryDirectory
+        .appending(component: "dspark_load_\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try save(arrays: weights, url: dir.appending(component: "model.safetensors"))
+    let configJSON = """
+        {"hidden_size":8,"vocab_size":16,"num_hidden_layers":1,
+         "num_attention_heads":2,"num_key_value_heads":1,"head_dim":4,
+         "intermediate_size":16,"rms_norm_eps":1e-6,"block_size":3,
+         "markov_rank":4,"mask_token_id":15,"max_position_embeddings":64,
+         "rope_parameters":{"rope_theta":1000000},"target_layer_ids":[0,1]}
+        """
+    try Data(configJSON.utf8).write(to: dir.appending(component: "config.json"))
+
+    let loaded = try Qwen3DSparkDrafter.load(directory: dir)
+    eval(loaded)
+    // Round-trip fidelity: a representative weight survived load unchanged.
+    #expect(allClose(loaded.fc.weight, model.fc.weight, rtol: 0, atol: 0).item(Bool.self))
+    // Seeded pairing.
+    #expect(
+        Qwen3DSparkDrafter.drafterForTarget["Qwen/Qwen3-4B"]
+            == "deepseek-ai/dspark_qwen3_4b_block7")
+}
