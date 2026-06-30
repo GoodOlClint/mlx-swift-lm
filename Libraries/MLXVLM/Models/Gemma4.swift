@@ -2580,6 +2580,13 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider {
     /// `mtpLastHiddenStatesKey`. Without the capture request this is
     /// bit-identical to the default text path. Overrides the protocol-extension
     /// default (which would discard `state`).
+    ///
+    /// Note: the MTP shared-K/V seam (`mtpEmitFlagKey`) is intentionally NOT
+    /// threaded here. `Gemma4AssistantDraftModel.draftBlock` only accepts the
+    /// non-unified `Gemma4` target, so emitting shared K/V for a unified target
+    /// would drive the MTP iterator into a `fatalError`. Leaving it unset keeps
+    /// MTP-on-unified as a graceful single-token passthrough. (Enabling unified
+    /// MTP needs the assistant to accept `Gemma4Unified` — separate work.)
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
