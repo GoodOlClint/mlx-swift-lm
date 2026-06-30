@@ -134,6 +134,7 @@ let package = Package(
             resources: [
                 .process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov"),
                 .copy("Resources/dspark_qwen3_tiny.safetensors"),
+                .copy("Resources/dspark_gemma4_tiny.safetensors"),
             ]
         ),
         .macro(
