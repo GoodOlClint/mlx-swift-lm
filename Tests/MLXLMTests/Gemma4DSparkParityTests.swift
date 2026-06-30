@@ -148,7 +148,8 @@ func testGemma4DSparkConfigDecodesRealShape() throws {
           "attention_k_eq_v": true, "final_logit_softcapping": 30.0, "rms_norm_eps": 1e-06,
           "rope_parameters": {
             "full_attention": {"partial_rotary_factor": 0.25, "rope_type": "proportional", "rope_theta": 1000000},
-            "sliding_attention": {"rope_type": "default", "rope_theta": 10000}
+            "sliding_attention": {"rope_type": "default", "rope_theta": 10000},
+            "rope_theta": null, "rope_type": "default"
           },
           "target_layer_ids": [5, 17, 29, 41, 46], "vocab_size": 262144
         }

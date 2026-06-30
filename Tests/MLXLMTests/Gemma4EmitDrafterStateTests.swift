@@ -98,6 +98,47 @@ func testGemma4TextEmitDisabledIsBitIdenticalRegressionBySynthetic() {
     )
 }
 
+// MARK: - DSpark multi-layer capture (mtpCaptureLayersKey)
+
+@Test
+func testGemma4TextCaptureLayersPopulatesLayerHiddensBySynthetic() {
+    let model = makeSyntheticGemma4TextLanguageModel(layerTypes: [
+        "full_attention", "sliding_attention",
+    ])
+    let cache = model.newCache(parameters: nil)
+    let inputs = MLXArray((0 ..< 8).map { Int32($0) }).reshaped([1, 8])
+
+    // DSpark requests post-block hiddens at specific layer indices.
+    let out = model(inputs, cache: cache, captureLayers: [0, 1])
+
+    #expect(out.state != nil, "captureLayers should populate LMOutput.state")
+    guard let captured = out.state?[mtpLayerHiddenStatesKey] else {
+        Issue.record("mtpLayerHiddenStatesKey not emitted")
+        return
+    }
+    #expect(Set(captured.keys) == [0, 1], "captured exactly the requested layer indices")
+    for (_, h) in captured {
+        eval(h)
+        #expect(h.shape == [1, 8, 4], "post-block hidden is [B, seq, hidden]")
+    }
+}
+
+@Test
+func testGemma4TextCaptureLayersBitIdenticalWhenAbsentBySynthetic() {
+    let model = makeSyntheticGemma4TextLanguageModel(layerTypes: [
+        "full_attention", "sliding_attention",
+    ])
+    let inputs = MLXArray((0 ..< 6).map { Int32($0) }).reshaped([1, 6])
+
+    let outDefault = model(inputs, cache: nil)
+    let outNoCapture = model(inputs, cache: nil, captureLayers: nil)
+    eval(outDefault.logits, outNoCapture.logits)
+    #expect(
+        allClose(outDefault.logits, outNoCapture.logits, rtol: 0, atol: 0).item(Bool.self),
+        "captureLayers=nil must be bit-identical to the default code path")
+    #expect(outNoCapture.state == nil)
+}
+
 // MARK: - Helpers
 
 /// Build a small 2-layer Gemma4TextLanguageModel with random-initialized

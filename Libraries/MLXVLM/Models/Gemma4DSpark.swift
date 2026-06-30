@@ -88,6 +88,34 @@ public struct Gemma4DSparkConfiguration: Sendable {
 }
 
 extension Gemma4DSparkConfiguration: Decodable {
+    /// Open-ended key for walking `rope_parameters`, whose real checkpoints mix
+    /// nested per-layer-type dicts (`full_attention`, `sliding_attention`) with
+    /// scalar siblings (`rope_theta: null`, `rope_type: "default"`).
+    private struct DynamicKey: CodingKey {
+        let stringValue: String
+        var intValue: Int? { nil }
+        init(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { nil }
+    }
+
+    /// Decode only the nested per-layer-type sub-dicts from `rope_parameters`,
+    /// tolerating (skipping) scalar/null siblings the released configs carry.
+    private static func decodeRopeParameters(
+        _ c: KeyedDecodingContainer<CodingKeys>
+    ) -> [String: [String: StringOrNumber]] {
+        guard
+            let nested = try? c.nestedContainer(
+                keyedBy: DynamicKey.self, forKey: .ropeParameters)
+        else { return [:] }
+        var result: [String: [String: StringOrNumber]] = [:]
+        for key in nested.allKeys {
+            if let sub = try? nested.decode([String: StringOrNumber].self, forKey: key) {
+                result[key.stringValue] = sub
+            }
+        }
+        return result
+    }
+
     private enum CodingKeys: String, CodingKey {
         case hiddenSize = "hidden_size"
         case vocabSize = "vocab_size"
@@ -133,8 +161,7 @@ extension Gemma4DSparkConfiguration: Decodable {
             attentionKEqV: try c.decodeIfPresent(Bool.self, forKey: .attentionKEqV) ?? false,
             finalLogitSoftcapping: try c.decodeIfPresent(
                 Float.self, forKey: .finalLogitSoftcapping),
-            ropeParameters: try c.decodeIfPresent(
-                [String: [String: StringOrNumber]].self, forKey: .ropeParameters) ?? [:],
+            ropeParameters: Self.decodeRopeParameters(c),
             maxPositionEmbeddings: try c.decodeIfPresent(
                 Int.self, forKey: .maxPositionEmbeddings) ?? 131_072,
             targetLayerIds: try c.decode([Int].self, forKey: .targetLayerIds),
@@ -411,10 +438,11 @@ public enum Gemma4DSparkDrafter {
     /// Seeded target-model-id → DSpark drafter-id map, from DeepSpec's released
     /// checkpoints. Like the Gemma 4 assistant, pairing is explicit (the target
     /// config does not advertise its drafter).
-    // ponytail: only the released 12B drafter id is known; add the exact MLX
-    // Gemma4-12B target id here once confirmed against the checkpoint pair.
+    // The bf16 target matches the precision the drafter conditions on (validated
+    // end-to-end). Quantized gemma-4-12B variants can be added as entries when
+    // their acceptance is measured.
     public static let drafterForTarget: [String: String] = [
-        "mlx-community/gemma-4-12b": "deepseek-ai/dspark_gemma4_12b_block7"
+        "mlx-community/gemma-4-12B-it-bf16": "deepseek-ai/dspark_gemma4_12b_block7"
     ]
 
     /// Load a DSpark drafter from a checkpoint directory (`config.json` +
