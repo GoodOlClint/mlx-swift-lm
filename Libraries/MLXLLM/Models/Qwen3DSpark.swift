@@ -223,3 +223,32 @@ public final class Qwen3DSparkModel: Module {
         return concatenated(toks, axis: 1)
     }
 }
+
+// MARK: - DSparkDrafting conformance
+
+extension Qwen3DSparkModel: DSparkDrafting {
+    public var targetLayerIds: [Int] { config.targetLayerIds }
+    public var blockSize: Int { config.blockSize }
+
+    /// Produce `numDraft` draft tokens conditioned on the `bonus` anchor `[B]`
+    /// and the accumulated multi-layer target context `[B, C, m*H]`. Builds the
+    /// noise embedding (anchor + mask tokens), runs the backbone with an
+    /// all-visible single-block-at-frontier mask, applies lm_head, and samples
+    /// the block greedily via the Markov head. Returns `[B, numDraft]`.
+    public func draftBlock(bonus: MLXArray, context: MLXArray, numDraft: Int) -> MLXArray {
+        let B = context.dim(0)
+        let C = context.dim(1)
+        let bonus2 = bonus.ndim == 1 ? bonus.reshaped(bonus.dim(0), 1) : bonus
+        // Noise ids: [bonus, mask, mask, ...] of length numDraft.
+        let maskIds = MLXArray.full(
+            [B, numDraft - 1], values: MLXArray(Int32(config.maskTokenId)))
+        let noiseIds = numDraft > 1 ? concatenated([bonus2, maskIds], axis: 1) : bonus2
+        let noiseEmb = embedTokens(noiseIds)
+        // Single block at the generation frontier: every draft position attends
+        // to all context + all draft (additive all-zeros mask).
+        let mask = MLXArray.zeros([B, 1, numDraft, C + numDraft], dtype: noiseEmb.dtype)
+        let hidden = backbone(noiseEmbedding: noiseEmb, targetHidden: context, mask: .array(mask))
+        let base = logits(hidden)
+        return markovSampleGreedy(base: base, anchor: bonus2.reshaped(B))
+    }
+}
