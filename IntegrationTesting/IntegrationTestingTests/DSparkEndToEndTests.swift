@@ -176,4 +176,63 @@ struct DSparkEndToEndTests {
             Array(dsTok.prefix(n)) == Array(baseTok.prefix(n)),
             "DSpark diverged from baseline within the first \(n) tokens at temp=0")
     }
+
+    /// Diagnostic: acceptance rate by domain. DSpark paper Table 1 reports
+    /// Qwen3-4B accepted-length τ that varies sharply by domain (chat ≈ 3.5 →
+    /// ~40% per-draft at block 7; math/code ≈ 5–6 → ~70–80%). If the substrate's
+    /// conditioning is correct, structured prompts should accept much more than
+    /// chat. If math/code sit near the chat rate, there's a real conditioning or
+    /// precision bug. Logs each; asserts only that math accepts at least as much
+    /// as chat (the expected ordering).
+    @Test
+    func testDSparkQwen3AcceptanceByDomain() async throws {
+        guard let pair = try await loadDSparkPair() else {
+            Issue.record("checkpoints not in HF cache; skipping")
+            return
+        }
+
+        let prompts: [(String, String)] = [
+            ("chat", "Why is the sky blue? Explain in one paragraph."),
+            (
+                "math",
+                "Natalia sold clips to 48 friends in April, then half as many in May. "
+                    + "How many clips did she sell altogether? Think step by step."
+            ),
+            (
+                "code",
+                "Write a Swift function that returns the nth Fibonacci number iteratively."
+            ),
+        ]
+
+        var rates: [String: Double] = [:]
+        for (domain, prompt) in prompts {
+            let lmInput = try await pair.context.processor.prepare(
+                input: UserInput(chat: [.user(prompt)]))
+            let stream = try generate(
+                input: lmInput,
+                parameters: GenerateParameters(maxTokens: 96, temperature: 0),
+                context: pair.context, dsparkDrafter: pair.drafter)
+            var info: GenerateCompletionInfo?
+            for await e in stream { if case .info(let i) = e { info = i } }
+            let proposed = info?.proposedDraftTokens ?? 0
+            let accepted = info?.acceptedDraftTokens ?? 0
+            let rate = proposed > 0 ? Double(accepted) / Double(proposed) : 0
+            let tps =
+                (info?.generateTime ?? 0) > 0
+                ? Double(info?.generationTokenCount ?? 0) / (info?.generateTime ?? 1) : 0
+            rates[domain] = rate
+            print(
+                "[DSpark domain=\(domain)] proposed=\(proposed) accepted=\(accepted) "
+                    + "rate=\(String(format: "%.1f%%", rate * 100)) tok/s=\(String(format: "%.2f", tps))"
+            )
+        }
+
+        // Expected ordering: structured > chat. A violation points at a
+        // conditioning bug (acceptance shouldn't be domain-flat if context
+        // injection works).
+        #expect(
+            (rates["math"] ?? 0) >= (rates["chat"] ?? 0),
+            "domain-flat acceptance (math \(rates["math"] ?? 0) < chat \(rates["chat"] ?? 0)) suggests context conditioning isn't helping"
+        )
+    }
 }
