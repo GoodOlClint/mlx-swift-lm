@@ -187,6 +187,67 @@ func testDSparkConfidenceThresholdIsLosslessAndTruncates() throws {
 }
 
 @Test
+func testDSparkSTSFitRecoversTemperatureAndCalibrates() {
+    // Over-confident logits z = a * logit(p), a = 2. Temperature scaling should
+    // recover T ≈ a and lower BCE vs T = 1. Build samples whose empirical
+    // acceptance at logit z is σ(z / a).
+    let a = 2.0
+    var logits: [Float] = []
+    var labels: [Bool] = []
+    for zi in stride(from: -6.0, through: 6.0, by: 0.5) {
+        let p = 1.0 / (1.0 + exp(-zi / a))
+        let m = 100
+        let accepted = Int((p * Double(m)).rounded())
+        for j in 0 ..< m {
+            logits.append(Float(zi))
+            labels.append(j < accepted)
+        }
+    }
+    let t = DSparkSTS.fitOne(logits: logits, labels: labels)
+    #expect(t > 1.4 && t < 3.0, "fitted T \(t) should be near the true a=2")
+
+    func bce(_ temp: Double) -> Double {
+        var s = 0.0
+        for (z, y) in zip(logits, labels) {
+            let p = 1.0 / (1.0 + exp(-Double(z) / temp))
+            let pc = Swift.min(Swift.max(p, 1e-7), 1 - 1e-7)
+            s += y ? -log(pc) : -log(1 - pc)
+        }
+        return s / Double(logits.count)
+    }
+    #expect(bce(Double(t)) < bce(1.0), "STS should improve calibration over T=1")
+
+    // No calibration signal (single class) ⇒ identity temperature.
+    #expect(DSparkSTS.fitOne(logits: [1, 2, 3], labels: [true, true, true]) == 1)
+}
+
+@Test
+func testDSparkSTSTemperatureShortensPrefix() throws {
+    // Confidence [2,2,2], threshold 0.7. T=1: σ(2)=0.88, cumulative .88/.77/.68 →
+    // keep 2. Hot temps T=4: σ(0.5)=0.62 < 0.7 on the first step → keep 1. So the
+    // hotter temperature prunes more (fewer drafts verified), same output.
+    func run(temps: [Float]?) throws -> (out: [Int], proposed: Int) {
+        let main = MockDSparkTarget(
+            nextLogitTokens: [0, 0] + Array(repeating: Int32(7), count: 40))
+        let drafter = MockDSparkDrafter(draftedTokenValue: 7, confidenceLogits: [2, 2, 2])
+        let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
+        var iter = try DSparkTokenIterator(
+            input: input, mainModel: main, drafter: drafter, mainCache: nil,
+            parameters: GenerateParameters(maxTokens: 16), blockSize: 4,
+            confidenceThreshold: 0.7, stsTemperatures: temps)
+        var out: [Int] = []
+        while let x = iter.next() { out.append(x) }
+        return (out, iter.proposedCount)
+    }
+    let cool = try run(temps: nil)
+    let hot = try run(temps: [4, 4, 4])
+    #expect(cool.out == hot.out, "STS temperature must not change output (lossless)")
+    #expect(
+        hot.proposed < cool.proposed,
+        "hotter temperature should prune more (cool \(cool.proposed), hot \(hot.proposed))")
+}
+
+@Test
 func testDSparkPartialAcceptanceEmitsMainSequenceOrder() throws {
     // drafter [5,5,5]; verify [5,5,7,9] → accept 2 + correction 7.
     let main = MockDSparkTarget(nextLogitTokens: [0, 0, 5, 5, 5, 7, 9])

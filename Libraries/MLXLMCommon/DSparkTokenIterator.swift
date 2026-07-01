@@ -79,6 +79,18 @@ public struct DSparkTokenIterator: TokenIteratorProtocol {
     /// Truncating proposals never changes emitted tokens, so this stays lossless.
     let confidenceThreshold: Float
 
+    /// Per-position STS temperatures `T_k` (DSpark §3.2): survival uses
+    /// `σ(logit_k / T_k)`. `nil` ⇒ `T = 1` (raw confidence). Fit offline; see
+    /// ``DSparkSTS``.
+    let stsTemperatures: [Float]?
+
+    /// When true, record per-draft-position `(confidence logit, accepted)` samples
+    /// for offline STS fitting. Opt-in; empty and zero-cost otherwise. Run with
+    /// `confidenceThreshold == 0` so acceptance is observed at every position.
+    private let collectConfidenceCalibration: Bool
+    public private(set) var confidenceCalibrationSamples:
+        [(logit: Float, position: Int, accepted: Bool)] = []
+
     /// Accumulated injected context `[B, C, m*H]`, grown per round from emitted
     /// layer hiddens and trimmed on rejection. `nil` until the first emission.
     // ponytail: accumulates + re-projects the full prefix each round (O(seq)).
@@ -111,11 +123,15 @@ public struct DSparkTokenIterator: TokenIteratorProtocol {
         mainCache: [KVCache]? = nil,
         parameters: GenerateParameters,
         blockSize: Int? = nil,
-        confidenceThreshold: Float = 0
+        confidenceThreshold: Float = 0,
+        stsTemperatures: [Float]? = nil,
+        collectConfidenceCalibration: Bool = false
     ) throws {
         let bs = blockSize ?? drafter.blockSize
         precondition(bs >= 2, "DSparkTokenIterator requires blockSize >= 2 (1 bonus + K-1 drafted)")
         self.confidenceThreshold = confidenceThreshold
+        self.stsTemperatures = stsTemperatures
+        self.collectConfidenceCalibration = collectConfidenceCalibration
 
         self.y = input.text
         self.mainModel = mainModel
@@ -294,6 +310,16 @@ public struct DSparkTokenIterator: TokenIteratorProtocol {
         processor?.didSample(token: finalToken)
         pendingTokens.append(mainTokensList[accepted])
 
+        // Offline STS calibration: label each drafted position as accepted iff the
+        // whole prefix up to it matched (position k survives ⇔ k < accepted).
+        if collectConfidenceCalibration, let confidence = draft.confidence {
+            let cl = confidence.asArray(Float.self)
+            for k in 0 ..< Swift.min(effectiveNumDraft, cl.count) {
+                confidenceCalibrationSamples.append(
+                    (logit: cl[k], position: k, accepted: k < accepted))
+            }
+        }
+
         proposedCount += effectiveNumDraft
         acceptedCount += accepted
         telemetry.recordRound(
@@ -323,7 +349,8 @@ public struct DSparkTokenIterator: TokenIteratorProtocol {
         var survival = 1.0
         var length = 0
         for k in 0 ..< Swift.min(numDraft, logits.count) {
-            survival *= 1.0 / (1.0 + exp(-Double(logits[k])))
+            let t = (stsTemperatures?.indices.contains(k) ?? false) ? Double(stsTemperatures![k]) : 1.0
+            survival *= 1.0 / (1.0 + exp(-Double(logits[k]) / t))
             if survival >= Double(threshold) { length += 1 } else { break }
         }
         return Swift.max(1, length)
