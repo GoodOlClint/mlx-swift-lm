@@ -228,6 +228,121 @@ struct Gemma4SpecDecodeBenchmarkTests {
         #expect(!lines.isEmpty)
     }
 
+    /// C4 DoD (ADR 0009): confidence-scheduled verify measurement. Fits STS
+    /// temperatures inline, then sweeps confidence thresholds × domains on the
+    /// bf16 12B + 8-bit drafter, reporting acceptance%, verify tokens/round, and
+    /// tok/s. Enforces losslessness: at temp=0 the emitted text must be identical
+    /// across thresholds (pruning proposals never changes output).
+    @Test
+    func testGemma4DSparkConfidenceSweep12BBF16() async throws {
+        let targetId = "mlx-community/gemma-4-12B-it-bf16"
+        let drafterId = "deepseek-ai/dspark_gemma4_12b_block7"
+        guard let targetDir = hfSnapshotDir(modelId: targetId),
+            let drafterDir = hfSnapshotDir(modelId: drafterId)
+        else {
+            Issue.record("bf16 12B target or DSpark drafter not in HF cache; skipping")
+            return
+        }
+        let context = try await VLMModelFactory.shared.load(
+            from: targetDir, using: #huggingFaceTokenizerLoader())
+        let drafter = try Gemma4DSparkDrafter.load(directory: drafterDir)
+        quantize(model: drafter, groupSize: 64, bits: 8, filter: { _, m in m is Linear })
+        eval(drafter)
+
+        // Fit STS temperatures inline (threshold 0 so acceptance is observed at
+        // every position), on a small domain mix.
+        let blockSize = drafter.blockSize
+        var logitsByPos = [[Float]](repeating: [], count: blockSize - 1)
+        var acceptedByPos = [[Bool]](repeating: [], count: blockSize - 1)
+        for prompt in [
+            "Why is the sky blue? Explain in one paragraph.",
+            "Natalia sold 48 clips in April then half as many in May. Total? Step by step.",
+        ] {
+            let input = try await context.processor.prepare(input: UserInput(chat: [.user(prompt)]))
+            var iter = try DSparkTokenIterator(
+                input: input, mainModel: context.model, drafter: drafter,
+                parameters: GenerateParameters(maxTokens: 96, temperature: 0),
+                confidenceThreshold: 0, collectConfidenceCalibration: true)
+            var n = 0
+            while n < 96, iter.next() != nil { n += 1 }
+            for s in iter.confidenceCalibrationSamples where s.position < blockSize - 1 {
+                logitsByPos[s.position].append(s.logit)
+                acceptedByPos[s.position].append(s.accepted)
+            }
+        }
+        let temps = DSparkSTS.fitTemperatures(
+            logitsPerPosition: logitsByPos, acceptedPerPosition: acceptedByPos)
+        print("[sweep] STS temps=\(temps)")
+
+        let prompts: [(String, String)] = [
+            ("chat", "Why is the sky blue? Explain in one paragraph."),
+            (
+                "math",
+                "Natalia sold clips to 48 friends in April, then half as many in May. "
+                    + "How many clips did she sell altogether? Think step by step."
+            ),
+            ("code", "Write a Swift function returning the nth Fibonacci number iteratively."),
+        ]
+        let thresholds: [Float] = [0.0, 0.5, 0.7]
+
+        print("\n=== DSpark 12B bf16 confidence sweep (STS, temp=0, 96 tok) ===")
+        print(
+            String(
+                format: "%-6@ %8@ %8@ %10@ %8@", "domain" as NSString, "thresh" as NSString,
+                "accept%" as NSString, "vrfy/round" as NSString, "tok/s" as NSString))
+        var lines: [String] = []
+        for (domain, prompt) in prompts {
+            let input = try await context.processor.prepare(input: UserInput(chat: [.user(prompt)]))
+            var baselineText: String?
+            for threshold in thresholds {
+                let run: (LMInput, GenerateParameters, ModelContext) throws -> AsyncStream<
+                    Generation
+                > = { i, p, c in
+                    try generate(
+                        input: i, parameters: p, context: c, dsparkDrafter: drafter,
+                        confidenceThreshold: threshold, stsTemperatures: temps)
+                }
+                _ = try await runStream(input, context, maxTokens: warmupTokens, build: run)
+                var info: GenerateCompletionInfo?
+                var text = ""
+                let params = GenerateParameters(maxTokens: 96, temperature: 0)
+                for await e in try run(input, params, context) {
+                    switch e {
+                    case .chunk(let c): text += c
+                    case .info(let i): info = i
+                    default: break
+                    }
+                }
+                // Lossless: temp=0 output must not depend on the threshold.
+                if let baselineText {
+                    #expect(
+                        text == baselineText,
+                        "\(domain): confidence threshold \(threshold) changed output — not lossless")
+                } else {
+                    baselineText = text
+                }
+                let proposed = info?.proposedDraftTokens ?? 0
+                let accepted = info?.acceptedDraftTokens ?? 0
+                let rate = proposed > 0 ? Double(accepted) / Double(proposed) : 0
+                let tel = info?.speculativeDecodingTelemetry
+                let vpr =
+                    (tel?.roundCount ?? 0) > 0
+                    ? Double(tel!.targetVerifiedTokenCount) / Double(tel!.roundCount) : 0
+                let tps =
+                    (info?.generateTime ?? 0) > 0
+                    ? Double(info?.generationTokenCount ?? 0) / (info?.generateTime ?? 1) : 0
+                lines.append(
+                    String(
+                        format: "%-6@ %8.2f %7.0f%% %10.2f %8.2f", domain as NSString, threshold,
+                        rate * 100, vpr, tps))
+            }
+        }
+        for l in lines { print(l) }
+        print("============================================================\n")
+        #expect(temps.count == blockSize - 1)
+        #expect(!lines.isEmpty)
+    }
+
     // MARK: - per-mode measurement (warm-up excluded)
 
     private func runStream(
