@@ -1758,6 +1758,7 @@ public func generate(
     context: ModelContext,
     dsparkDrafter: any DSparkDrafting,
     blockSize: Int? = nil,
+    confidenceThreshold: Float = 0,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<Generation> {
     let iterator = try DSparkTokenIterator(
@@ -1766,7 +1767,8 @@ public func generate(
         drafter: dsparkDrafter,
         mainCache: cache,
         parameters: parameters,
-        blockSize: blockSize
+        blockSize: blockSize,
+        confidenceThreshold: confidenceThreshold
     )
     let (stream, _) = generateLoopTask(
         promptTokenCount: input.text.tokens.size,
@@ -1795,6 +1797,7 @@ public func generateTokens(
     context: ModelContext,
     dsparkDrafter: any DSparkDrafting,
     blockSize: Int? = nil,
+    confidenceThreshold: Float = 0,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<TokenGeneration> {
     let iterator = try DSparkTokenIterator(
@@ -1803,7 +1806,8 @@ public func generateTokens(
         drafter: dsparkDrafter,
         mainCache: cache,
         parameters: parameters,
-        blockSize: blockSize
+        blockSize: blockSize,
+        confidenceThreshold: confidenceThreshold
     )
     let (stream, _) = generateLoopTask(
         promptTokenCount: input.text.tokens.size,

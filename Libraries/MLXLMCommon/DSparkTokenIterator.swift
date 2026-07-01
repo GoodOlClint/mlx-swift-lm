@@ -14,6 +14,20 @@ import MLX
 /// injects target hidden states from multiple layers over the entire prefix as
 /// K/V into every draft layer, which the MTP capture seam does not carry. See
 /// `docs/decisions/0006`.
+/// A drafted block: the proposed tokens plus, when the drafter has a confidence
+/// head, the per-position acceptance **logits** used to prune low-confidence
+/// suffix tokens before verify (DSpark §3.2.1). `confidence == nil` ⇒ the
+/// iterator verifies the full block (fixed-length).
+public struct DSparkDraft {
+    public let tokens: MLXArray  // [B, numDraft]
+    public let confidence: MLXArray?  // [B, numDraft] acceptance logits, or nil
+
+    public init(tokens: MLXArray, confidence: MLXArray? = nil) {
+        self.tokens = tokens
+        self.confidence = confidence
+    }
+}
+
 public protocol DSparkDrafting {
     /// Target decoder-layer indices whose hidden states form the injected
     /// context (DSpark `target_layer_ids`). The iterator requests capture at
@@ -23,10 +37,11 @@ public protocol DSparkDrafting {
     /// Draft block size γ (anchor + γ−1 positions).
     var blockSize: Int { get }
 
-    /// Produce `numDraft` draft tokens `[B, numDraft]` conditioned on the
-    /// `bonus` anchor `[B]` and the accumulated context `[B, C, m*H]` (the m
-    /// target-layer hiddens concatenated on the feature axis).
-    func draftBlock(bonus: MLXArray, context: MLXArray, numDraft: Int) -> MLXArray
+    /// Produce `numDraft` draft tokens `[B, numDraft]` (with optional per-position
+    /// confidence logits) conditioned on the `bonus` anchor `[B]` and the
+    /// accumulated context `[B, C, m*H]` (the m target-layer hiddens concatenated
+    /// on the feature axis).
+    func draftBlock(bonus: MLXArray, context: MLXArray, numDraft: Int) -> DSparkDraft
 }
 
 /// Speculative token iterator for DSpark drafters. Mirrors
@@ -56,6 +71,13 @@ public struct DSparkTokenIterator: TokenIteratorProtocol {
     public var tokenCount: Int { telemetry.emittedTokenCount }
     public let maxTokens: Int?
     public let blockSize: Int
+
+    /// Confidence-scheduled verify threshold (DSpark §3.2.1). When > 0 and the
+    /// drafter emits confidence, the proposal is truncated to the longest prefix
+    /// whose cumulative survival ∏ σ(logit_i) ≥ threshold before verify, pruning
+    /// low-confidence suffix tokens. `0` ⇒ fixed-length verify (unchanged).
+    /// Truncating proposals never changes emitted tokens, so this stays lossless.
+    let confidenceThreshold: Float
 
     /// Accumulated injected context `[B, C, m*H]`, grown per round from emitted
     /// layer hiddens and trimmed on rejection. `nil` until the first emission.
@@ -88,10 +110,12 @@ public struct DSparkTokenIterator: TokenIteratorProtocol {
         drafter: any DSparkDrafting,
         mainCache: [KVCache]? = nil,
         parameters: GenerateParameters,
-        blockSize: Int? = nil
+        blockSize: Int? = nil,
+        confidenceThreshold: Float = 0
     ) throws {
         let bs = blockSize ?? drafter.blockSize
         precondition(bs >= 2, "DSparkTokenIterator requires blockSize >= 2 (1 bonus + K-1 drafted)")
+        self.confidenceThreshold = confidenceThreshold
 
         self.y = input.text
         self.mainModel = mainModel
@@ -210,14 +234,28 @@ public struct DSparkTokenIterator: TokenIteratorProtocol {
         let ctx = context!
 
         let bonusToken = y.tokens
-        let draftTokens = drafter.draftBlock(bonus: bonusToken, context: ctx, numDraft: numDraft)
-        let flatDraftTokens = draftTokens.flattened()
+        let draft = drafter.draftBlock(bonus: bonusToken, context: ctx, numDraft: numDraft)
 
-        // Verify pass: [bonus, d_1 ... d_numDraft] in one forward, emitting next
-        // round's layer hiddens.
+        // Confidence-scheduled truncation (§3.2.1): prune the low-confidence
+        // suffix before verify. Lossless — proposing fewer drafts never changes
+        // emitted tokens. `threshold == 0` (or no confidence) keeps the full block.
+        let effectiveNumDraft: Int
+        if confidenceThreshold > 0, let confidence = draft.confidence {
+            effectiveNumDraft = confidencePrefixLength(
+                confidence, numDraft: numDraft, threshold: confidenceThreshold)
+        } else {
+            effectiveNumDraft = numDraft
+        }
+        let flatDraftTokens =
+            effectiveNumDraft < numDraft
+            ? draft.tokens.flattened()[0 ..< effectiveNumDraft]
+            : draft.tokens.flattened()
+
+        // Verify pass: [bonus, d_1 ... d_effectiveNumDraft] in one forward,
+        // emitting next round's layer hiddens.
         let verifyTokens = concatenated([bonusToken, flatDraftTokens])
         let verifyInput = LMInput.Text(tokens: verifyTokens)
-        let verifyStart = verifyInput.tokens.dim(0) - (numDraft + 1)
+        let verifyStart = verifyInput.tokens.dim(0) - (effectiveNumDraft + 1)
         let mainResult = mainModel(
             verifyInput[text: .newAxis], cache: mainCache, state: emitState())
         let mainLogits = mainResult.logits
@@ -226,7 +264,7 @@ public struct DSparkTokenIterator: TokenIteratorProtocol {
         let mainTokens: MLXArray
         if var verifyProcessorCopy = processor {
             var sampled = [MLXArray]()
-            for i in 0 ..< (numDraft + 1) {
+            for i in 0 ..< (effectiveNumDraft + 1) {
                 var logits = mainLogits[0..., verifyStart + i, 0...]
                 logits = verifyProcessorCopy.process(logits: logits)
                 let token = sampler.sample(logits: logits)
@@ -244,7 +282,7 @@ public struct DSparkTokenIterator: TokenIteratorProtocol {
         let draftTokensList = flatDraftTokens.asArray(Int.self)
 
         var accepted = 0
-        for i in 0 ..< numDraft {
+        for i in 0 ..< effectiveNumDraft {
             guard mainTokensList[i] == draftTokensList[i] else { break }
             let drafted = flatDraftTokens[i ..< (i + 1)]
             processor?.didSample(token: drafted)
@@ -256,21 +294,39 @@ public struct DSparkTokenIterator: TokenIteratorProtocol {
         processor?.didSample(token: finalToken)
         pendingTokens.append(mainTokensList[accepted])
 
-        proposedCount += numDraft
+        proposedCount += effectiveNumDraft
         acceptedCount += accepted
         telemetry.recordRound(
-            drafted: numDraft, accepted: accepted,
-            targetVerified: numDraft + 1, draftModelCalls: 1)
+            drafted: effectiveNumDraft, accepted: accepted,
+            targetVerified: effectiveNumDraft + 1, draftModelCalls: 1)
 
         // Rewind the cache and this round's emission by the rejected count, in
         // lockstep, so next round's appended chunk excludes rejected positions.
-        let rejected = numDraft - accepted
+        let rejected = effectiveNumDraft - accepted
         let trimmed = trimPromptCache(mainCache, numTokens: rejected)
         trimLayerHiddenState(&mainState, numTokens: trimmed)
         quantizeKVCache(&mainCache)
 
         if let context { eval(context) }  // bound the lazy graph each round
         y = .init(tokens: finalToken)
+    }
+
+    /// Longest prefix length L (1...numDraft) whose cumulative survival
+    /// `∏_{i<L} σ(confidence_i) ≥ threshold`. Each `σ ∈ (0,1)`, so the cumulative
+    /// product is monotone non-increasing and the survivors form a prefix. Floors
+    /// at 1 so every round still verifies at least one draft. `confidence` is the
+    /// per-position acceptance logits `[1, numDraft]` (single stream).
+    private func confidencePrefixLength(
+        _ confidence: MLXArray, numDraft: Int, threshold: Float
+    ) -> Int {
+        let logits = confidence.asArray(Float.self)
+        var survival = 1.0
+        var length = 0
+        for k in 0 ..< Swift.min(numDraft, logits.count) {
+            survival *= 1.0 / (1.0 + exp(-Double(logits[k])))
+            if survival >= Double(threshold) { length += 1 } else { break }
+        }
+        return Swift.max(1, length)
     }
 
     private mutating func switchToPassthrough(reason: String) {

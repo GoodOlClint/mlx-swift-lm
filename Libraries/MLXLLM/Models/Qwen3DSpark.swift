@@ -336,6 +336,29 @@ public final class Qwen3DSparkModel: Module {
         }
         return concatenated(toks, axis: 1)
     }
+
+    /// Like ``markovSampleGreedy`` but also returns per-position confidence logits
+    /// (Eq. 7) when the confidence head is present. `hidden` `[B, block, H]` is the
+    /// backbone output; confidence at position k uses `hidden[:, k]` and the prev
+    /// token (anchor for k=0). Returns `(tokens [B, block], confidence [B, block]?)`.
+    public func markovSampleGreedyWithConfidence(
+        base: MLXArray, hidden: MLXArray, anchor: MLXArray
+    ) -> (tokens: MLXArray, confidence: MLXArray?) {
+        let hasConfidence = confidenceHead != nil
+        var prev = anchor
+        var toks: [MLXArray] = []
+        var confs: [MLXArray] = []
+        for k in 0 ..< base.dim(1) {
+            if hasConfidence, let cl = confidenceLogit(hidden: hidden[0..., k, 0...], prev: prev) {
+                confs.append(cl.reshaped(cl.dim(0), 1))
+            }
+            let step = base[0..., k, 0...] + markovHead.bias(prev)
+            let tok = argMax(step, axis: -1)
+            toks.append(tok.reshaped(tok.dim(0), 1))
+            prev = tok
+        }
+        return (concatenated(toks, axis: 1), hasConfidence ? concatenated(confs, axis: 1) : nil)
+    }
 }
 
 // MARK: - DSparkDrafting conformance
@@ -349,7 +372,7 @@ extension Qwen3DSparkModel: DSparkDrafting {
     /// noise embedding (anchor + mask tokens), runs the backbone with an
     /// all-visible single-block-at-frontier mask, applies lm_head, and samples
     /// the block greedily via the Markov head. Returns `[B, numDraft]`.
-    public func draftBlock(bonus: MLXArray, context: MLXArray, numDraft: Int) -> MLXArray {
+    public func draftBlock(bonus: MLXArray, context: MLXArray, numDraft: Int) -> DSparkDraft {
         let B = context.dim(0)
         let C = context.dim(1)
         let bonus2 = bonus.ndim == 1 ? bonus.reshaped(bonus.dim(0), 1) : bonus
@@ -363,7 +386,9 @@ extension Qwen3DSparkModel: DSparkDrafting {
         let mask = MLXArray.zeros([B, 1, numDraft, C + numDraft], dtype: noiseEmb.dtype)
         let hidden = backbone(noiseEmbedding: noiseEmb, targetHidden: context, mask: .array(mask))
         let base = logits(hidden)
-        return markovSampleGreedy(base: base, anchor: bonus2.reshaped(B))
+        let (tokens, confidence) = markovSampleGreedyWithConfidence(
+            base: base, hidden: hidden, anchor: bonus2.reshaped(B))
+        return DSparkDraft(tokens: tokens, confidence: confidence)
     }
 }
 

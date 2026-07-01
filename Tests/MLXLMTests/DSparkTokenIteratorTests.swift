@@ -15,18 +15,29 @@ private final class MockDSparkDrafter: DSparkDrafting {
     var targetLayerIds: [Int] { [0, 1] }
     var blockSize: Int { 4 }
     let draftedTokenValue: Int32
+    /// Optional per-position confidence logits `[numDraft]` (batch 1) for the
+    /// truncation path; nil ⇒ no confidence (fixed-length).
+    let confidenceLogits: [Float]?
     private(set) var draftBlockCallCount = 0
     /// Context sequence length seen on each call — pins the accumulation/trim.
     private(set) var receivedContextLengths: [Int] = []
 
-    init(draftedTokenValue: Int32 = 7) { self.draftedTokenValue = draftedTokenValue }
+    init(draftedTokenValue: Int32 = 7, confidenceLogits: [Float]? = nil) {
+        self.draftedTokenValue = draftedTokenValue
+        self.confidenceLogits = confidenceLogits
+    }
 
-    func draftBlock(bonus: MLXArray, context: MLXArray, numDraft: Int) -> MLXArray {
+    func draftBlock(bonus: MLXArray, context: MLXArray, numDraft: Int) -> DSparkDraft {
         draftBlockCallCount += 1
         receivedContextLengths.append(context.dim(1))
         let batch = context.dim(0)
-        return MLXArray(
+        let tokens = MLXArray(
             Array(repeating: draftedTokenValue, count: numDraft * batch), [batch, numDraft])
+        let confidence = confidenceLogits.map { logits -> MLXArray in
+            let vals = Array(logits.prefix(numDraft))
+            return MLXArray(vals, [1, vals.count])
+        }
+        return DSparkDraft(tokens: tokens, confidence: confidence)
     }
 }
 
@@ -138,6 +149,41 @@ func testDSparkAllDraftsAcceptedMatchesGreedy() throws {
     #expect(iter.acceptedCount == 3)
     #expect(drafter.draftBlockCallCount == 1)
     #expect(main.lastIncomingCaptureLayers == [0, 1])
+}
+
+@Test
+func testDSparkConfidenceThresholdIsLosslessAndTruncates() throws {
+    // Confidence-scheduled verify (ADR 0009 C2). Same target/drafter run twice:
+    // fixed-length (threshold 0) vs threshold 0.9 with confidence that dooms the
+    // 3rd draft (logits [10,10,-10] → cumulative survival ≈ [1, 1, 0] → keep 2).
+    // Truncating proposals must NOT change the emitted tokens (lossless); it only
+    // shrinks per-round verify, so the same token budget needs more rounds.
+    func run(threshold: Float, confidence: [Float]?) throws -> (out: [Int], proposed: Int) {
+        let main = MockDSparkTarget(
+            nextLogitTokens: [0, 0] + Array(repeating: Int32(7), count: 40))
+        let drafter = MockDSparkDrafter(draftedTokenValue: 7, confidenceLogits: confidence)
+        let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
+        var iter = try DSparkTokenIterator(
+            input: input, mainModel: main, drafter: drafter, mainCache: nil,
+            parameters: GenerateParameters(maxTokens: 16), blockSize: 4,
+            confidenceThreshold: threshold)
+        var out: [Int] = []
+        while let t = iter.next() { out.append(t) }
+        return (out, iter.proposedCount)
+    }
+
+    let base = try run(threshold: 0, confidence: nil)
+    let pruned = try run(threshold: 0.9, confidence: [10, 10, -10])
+
+    #expect(base.out.count == 16)
+    // Lossless: identical emitted tokens regardless of the confidence threshold.
+    #expect(base.out == pruned.out, "confidence truncation changed output — not lossless")
+    // Truncation reduced verify work: fewer drafts submitted to the target overall
+    // (2/round pruned vs 3/round fixed-length).
+    #expect(
+        pruned.proposed < base.proposed,
+        "expected fewer drafts verified under truncation (base \(base.proposed), pruned \(pruned.proposed))"
+    )
 }
 
 @Test
