@@ -6,6 +6,7 @@ import IntegrationTestHelpers
 import MLX
 import MLXHuggingFace
 @_spi(Testing) import MLXLMCommon
+import MLXNN
 import MLXVLM
 import Testing
 import Tokenizers
@@ -55,6 +56,13 @@ struct Gemma4SpecDecodeBenchmarkTests {
                 "deepseek-ai/dspark_gemma4_12b_block7"
             ),
             (
+                // Unquantized target — the favorable DSpark regime (slow baseline).
+                // MTP skipped: the 12B is Gemma4Unified and the assistant rejects it.
+                "mlx-community/gemma-4-12B-it-bf16",
+                nil,
+                "deepseek-ai/dspark_gemma4_12b_block7"
+            ),
+            (
                 "mlx-community/gemma-4-26b-a4b-it-8bit",
                 "mlx-community/gemma-4-26B-A4B-it-assistant-bf16",
                 nil
@@ -99,12 +107,23 @@ struct Gemma4SpecDecodeBenchmarkTests {
                 print("[bench] SKIP MTP for \(entry.target) — drafter not in cache")
             }
 
-            // --- DSpark ---
+            // --- DSpark (bf16 drafter, then the same drafter quantized to 8-bit) ---
             if let dsId = entry.dspark, let drafterDir = hfSnapshotDir(modelId: dsId) {
                 let drafter = try Gemma4DSparkDrafter.load(directory: drafterDir)
                 rows.append(
                     try await measureDSpark(
-                        target: entry.target, context: context, input: lmInput, drafter: drafter))
+                        target: entry.target, mode: "DSpark/bf16", context: context,
+                        input: lmInput, drafter: drafter))
+                // Quantize the drafter's Linears to 8-bit in place and re-measure.
+                // The released drafter ships bf16 only; an 8-bit drafter is the
+                // realistic deployed config against an 8-bit target and cuts the
+                // draft-forward overhead.
+                quantize(model: drafter, groupSize: 64, bits: 8, filter: { _, m in m is Linear })
+                eval(drafter)
+                rows.append(
+                    try await measureDSpark(
+                        target: entry.target, mode: "DSpark/8b", context: context,
+                        input: lmInput, drafter: drafter))
             }
         }
 
@@ -134,6 +153,79 @@ struct Gemma4SpecDecodeBenchmarkTests {
         print("====================================================================\n")
 
         #expect(!rows.isEmpty, "no benchmark rows produced — no checkpoints in cache?")
+    }
+
+    /// DSpark's advantage is domain-shaped: the paper's accepted length τ for
+    /// Gemma4-12B rises from ~2.9–3.5 (chat) to ~4.5–6.0 (math/code). This sweeps
+    /// chat / math / code / multi-step reasoning on the **bf16** 12B target with
+    /// the **8-bit drafter** (the best deployable config) and reports per-domain
+    /// acceptance, τ, and wall-clock speedup vs plain decode.
+    ///
+    /// Prompts elicit inline step-by-step reasoning (non-thinking mode) to match
+    /// the released drafter's training. (DeepSpec notes thinking-mode use wants a
+    /// re-tuned drafter.)
+    @Test
+    func testGemma4DSparkAcceptanceByDomain12BBF16() async throws {
+        let targetId = "mlx-community/gemma-4-12B-it-bf16"
+        let drafterId = "deepseek-ai/dspark_gemma4_12b_block7"
+        guard let targetDir = hfSnapshotDir(modelId: targetId),
+            let drafterDir = hfSnapshotDir(modelId: drafterId)
+        else {
+            Issue.record("bf16 12B target or DSpark drafter not in HF cache; skipping")
+            return
+        }
+        let context = try await VLMModelFactory.shared.load(
+            from: targetDir, using: #huggingFaceTokenizerLoader())
+        let drafter = try Gemma4DSparkDrafter.load(directory: drafterDir)
+        quantize(model: drafter, groupSize: 64, bits: 8, filter: { _, m in m is Linear })
+        eval(drafter)
+
+        let prompts: [(String, String)] = [
+            ("chat", "Why is the sky blue? Explain in one paragraph."),
+            (
+                "math",
+                "Natalia sold clips to 48 friends in April, then half as many in May. "
+                    + "How many clips did she sell altogether? Think step by step."
+            ),
+            (
+                "code",
+                "Write a Swift function that returns the nth Fibonacci number iteratively, "
+                    + "with a brief explanation."
+            ),
+            (
+                "reason",
+                "Three friends — Ann, Bob, and Cid — each have a different pet (cat, dog, fish). "
+                    + "Ann doesn't have the cat. Bob has the dog. Who has the fish? "
+                    + "Reason step by step."
+            ),
+        ]
+
+        var lines: [String] = []
+        let blk = drafter.blockSize  // proposed per round = blk - 1
+        for (domain, prompt) in prompts {
+            let input = try await context.processor.prepare(
+                input: UserInput(chat: [.user(prompt)]))
+            let base = try await measurePlain(target: domain, context: context, input: input)
+            let ds = try await measureDSpark(
+                target: domain, mode: "DSpark", context: context, input: input, drafter: drafter)
+            let acc = ds.acceptRate ?? 0
+            let tau = acc * Double(blk - 1) + 1.0  // accepted drafts + 1 bonus
+            let speedup = (base?.tps ?? 0) > 0 ? ds.tps / base!.tps : 0
+            lines.append(
+                String(
+                    format: "%-8@ %7.0f%% %6.2f %9.2f %9.2f %8.2fx",
+                    domain as NSString, acc * 100, tau, base?.tps ?? 0, ds.tps, speedup))
+        }
+
+        print("\n=== DSpark 12B bf16 + 8-bit drafter, by domain (temp=0, \(measureTokens) tok) ===")
+        print(
+            String(
+                format: "%-8@ %8@ %6@ %9@ %9@ %8@", "domain" as NSString, "accept%" as NSString,
+                "tau" as NSString, "base t/s" as NSString, "DSpark" as NSString,
+                "speedup" as NSString))
+        for l in lines { print(l) }
+        print("=================================================================\n")
+        #expect(!lines.isEmpty)
     }
 
     // MARK: - per-mode measurement (warm-up excluded)
@@ -184,7 +276,8 @@ struct Gemma4SpecDecodeBenchmarkTests {
     }
 
     private func measureDSpark(
-        target: String, context: ModelContext, input: LMInput, drafter: Gemma4DSparkModel
+        target: String, mode: String, context: ModelContext, input: LMInput,
+        drafter: Gemma4DSparkModel
     ) async throws -> BenchRow {
         let run: (LMInput, GenerateParameters, ModelContext) throws -> AsyncStream<Generation> = {
             i, p, c in
@@ -195,7 +288,7 @@ struct Gemma4SpecDecodeBenchmarkTests {
         let proposed = info.proposedDraftTokens ?? 0
         let accepted = info.acceptedDraftTokens ?? 0
         return BenchRow(
-            target: target, mode: "DSpark", tps: tokPerSec(info),
+            target: target, mode: mode, tps: tokPerSec(info),
             genTokens: info.generationTokenCount,
             acceptRate: proposed > 0 ? Double(accepted) / Double(proposed) : 0,
             passthrough: info.passthroughReason)
