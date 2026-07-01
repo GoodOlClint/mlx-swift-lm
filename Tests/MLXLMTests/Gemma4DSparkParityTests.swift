@@ -42,7 +42,8 @@ private func gemma4TinyConfig() -> Gemma4DSparkConfiguration {
         ],
         maxPositionEmbeddings: 64, targetLayerIds: Array(0 ..< Gemma4TinyMeta.m),
         blockSize: Gemma4TinyMeta.block, markovRank: Gemma4TinyMeta.rank,
-        maskTokenId: Gemma4TinyMeta.V - 1)
+        maskTokenId: Gemma4TinyMeta.V - 1,
+        enableConfidenceHead: true, confidenceHeadWithMarkov: true)
 }
 
 @Test
@@ -61,7 +62,7 @@ func testGemma4DSparkParityVsDeepSpecReference() throws {
     var params: [String: MLXArray] = [:]
     for (k, v) in all where k.hasPrefix("w.") {
         let key = String(k.dropFirst(2))
-        if key.hasPrefix("confidence_head") || key.hasPrefix("rotary_emb") { continue }
+        if key.hasPrefix("rotary_emb") { continue }
         params[key] = v
     }
     try model.update(parameters: ModuleParameters.unflattened(params), verify: [])
@@ -129,6 +130,24 @@ func testGemma4DSparkParityVsDeepSpecReference() throws {
             .item(Bool.self),
         "end-to-end draft tokens diverged from reference, diff \((e2eToks.asType(.int32) - all["out.markov_tokens"]!.asType(.int32)).abs().max().item(Int32.self))"
     )
+
+    // (6) Confidence head logits — Eq. 7. Feed reference backbone hiddens + tokens
+    // so this isolates the head (proj over [hidden ; w1[prev]]).
+    let refMarkov = all["out.markov_tokens"]!.asType(.int32)
+    var confParts: [MLXArray] = []
+    var cprev = MLXArray([Int32(Gemma4TinyMeta.anchor)])
+    for k in 0 ..< Gemma4TinyMeta.block {
+        let hiddenK = all["out.backbone_out"]![0..., k, 0...]
+        let logit = model.confidenceLogit(hidden: hiddenK, prev: cprev)!
+        confParts.append(logit.reshaped(1, 1))
+        cprev = refMarkov[0..., k]
+    }
+    let conf = concatenated(confParts, axis: 1)
+    eval(conf)
+    let confDiff = (conf - all["out.confidence"]!).abs().max().item(Float.self)
+    #expect(
+        allClose(conf, all["out.confidence"]!, rtol: fuseTol, atol: fuseTol).item(Bool.self),
+        "confidence head mismatch, max-diff \(confDiff)")
 }
 
 // MARK: - Config decoding
@@ -212,6 +231,6 @@ func testGemma4DSparkLoaderRoundTripsAndSanitizes() throws {
     #expect(allClose(loaded.fc.weight, model.fc.weight, rtol: 0, atol: 0).item(Bool.self))
     // Seeded pairing.
     #expect(
-        Gemma4DSparkDrafter.drafterForTarget["mlx-community/gemma-4-12b"]
+        Gemma4DSparkDrafter.drafterForTarget["mlx-community/gemma-4-12B-it-bf16"]
             == "deepseek-ai/dspark_gemma4_12b_block7")
 }

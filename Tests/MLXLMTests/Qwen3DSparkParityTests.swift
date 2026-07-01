@@ -37,14 +37,16 @@ func testQwen3DSparkParityVsDeepSpecReference() throws {
         numAttentionHeads: TinyMeta.nH, numKeyValueHeads: TinyMeta.nKV, headDim: TinyMeta.headDim,
         intermediateSize: 32, rmsNormEps: 1e-6, ropeTheta: 1e6,
         targetLayerIds: Array(0 ..< TinyMeta.m), blockSize: TinyMeta.block,
-        markovRank: TinyMeta.rank, maskTokenId: TinyMeta.V - 1, maxPositionEmbeddings: 64)
+        markovRank: TinyMeta.rank, maskTokenId: TinyMeta.V - 1, maxPositionEmbeddings: 64,
+        enableConfidenceHead: true, confidenceHeadWithMarkov: true)
     let model = Qwen3DSparkModel(cfg)
 
-    // Load reference weights (strip "w." prefix; confidence head is deferred).
+    // Load reference weights (strip "w." prefix). The confidence head is now
+    // modeled, so keep its weights; only rotary_emb has no counterpart.
     var params: [String: MLXArray] = [:]
     for (k, v) in all where k.hasPrefix("w.") {
         let key = String(k.dropFirst(2))
-        if key.hasPrefix("confidence_head") || key.hasPrefix("rotary_emb") { continue }
+        if key.hasPrefix("rotary_emb") { continue }
         params[key] = v
     }
     try model.update(parameters: ModuleParameters.unflattened(params), verify: [])
@@ -90,6 +92,24 @@ func testQwen3DSparkParityVsDeepSpecReference() throws {
         allClose(toks.asType(.int32), all["out.markov_tokens"]!.asType(.int32), rtol: 0, atol: 0)
             .item(Bool.self),
         "Markov greedy token sequence mismatch")
+
+    // (5) Confidence head logits — Eq. 7. Feed reference backbone hiddens + tokens
+    // so this isolates the head (proj over [hidden ; w1[prev]]).
+    let refMarkov = all["out.markov_tokens"]!.asType(.int32)
+    var confParts: [MLXArray] = []
+    var cprev = MLXArray([Int32(TinyMeta.anchor)])
+    for k in 0 ..< TinyMeta.block {
+        let hiddenK = all["out.backbone_out"]![0..., k, 0...]
+        let logit = model.confidenceLogit(hidden: hiddenK, prev: cprev)!
+        confParts.append(logit.reshaped(1, 1))
+        cprev = refMarkov[0..., k]
+    }
+    let conf = concatenated(confParts, axis: 1)
+    eval(conf)
+    let confDiff = (conf - all["out.confidence"]!).abs().max().item(Float.self)
+    #expect(
+        allClose(conf, all["out.confidence"]!, rtol: tol, atol: tol).item(Bool.self),
+        "confidence head mismatch, max-diff \(confDiff)")
 }
 
 // MARK: - Config decoding

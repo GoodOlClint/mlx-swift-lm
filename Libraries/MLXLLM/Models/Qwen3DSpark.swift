@@ -35,12 +35,21 @@ public struct Qwen3DSparkConfiguration: Sendable {
     public var markovRank: Int
     public var maskTokenId: Int
     public var maxPositionEmbeddings: Int
+    public var enableConfidenceHead: Bool
+    public var confidenceHeadWithMarkov: Bool
+
+    /// Input width of the confidence head's `proj`: the backbone hidden, plus the
+    /// Markov prev-token embedding when `confidence_head_with_markov`.
+    public var confidenceInputDim: Int {
+        hiddenSize + (confidenceHeadWithMarkov ? markovRank : 0)
+    }
 
     public init(
         hiddenSize: Int, vocabSize: Int, numHiddenLayers: Int, numAttentionHeads: Int,
         numKeyValueHeads: Int, headDim: Int, intermediateSize: Int, rmsNormEps: Float,
         ropeTheta: Float, targetLayerIds: [Int], blockSize: Int, markovRank: Int,
-        maskTokenId: Int, maxPositionEmbeddings: Int
+        maskTokenId: Int, maxPositionEmbeddings: Int,
+        enableConfidenceHead: Bool = false, confidenceHeadWithMarkov: Bool = false
     ) {
         self.hiddenSize = hiddenSize
         self.vocabSize = vocabSize
@@ -56,6 +65,8 @@ public struct Qwen3DSparkConfiguration: Sendable {
         self.markovRank = markovRank
         self.maskTokenId = maskTokenId
         self.maxPositionEmbeddings = maxPositionEmbeddings
+        self.enableConfidenceHead = enableConfidenceHead
+        self.confidenceHeadWithMarkov = confidenceHeadWithMarkov
     }
 }
 
@@ -76,6 +87,8 @@ extension Qwen3DSparkConfiguration: Decodable {
         case markovRank = "markov_rank"
         case maskTokenId = "mask_token_id"
         case maxPositionEmbeddings = "max_position_embeddings"
+        case enableConfidenceHead = "enable_confidence_head"
+        case confidenceHeadWithMarkov = "confidence_head_with_markov"
     }
 
     private struct RopeParameters: Decodable {
@@ -106,7 +119,11 @@ extension Qwen3DSparkConfiguration: Decodable {
             markovRank: try c.decode(Int.self, forKey: .markovRank),
             maskTokenId: try c.decode(Int.self, forKey: .maskTokenId),
             maxPositionEmbeddings: try c.decodeIfPresent(
-                Int.self, forKey: .maxPositionEmbeddings) ?? 40960
+                Int.self, forKey: .maxPositionEmbeddings) ?? 40960,
+            enableConfidenceHead: try c.decodeIfPresent(
+                Bool.self, forKey: .enableConfidenceHead) ?? false,
+            confidenceHeadWithMarkov: try c.decodeIfPresent(
+                Bool.self, forKey: .confidenceHeadWithMarkov) ?? false
         )
     }
 }
@@ -213,6 +230,27 @@ final class Qwen3DSparkMarkovHead: Module {
     func bias(_ prev: MLXArray) -> MLXArray { w2(w1(prev)) }
 }
 
+// MARK: - Confidence head (Eq. 7 — per-position acceptance estimator)
+
+/// DSpark `AcceptRatePredictor`: a single `Linear(inputDim → 1)` over the
+/// per-position feature `[hidden ; markov_w1[prev]]` (or just `hidden` when not
+/// `with_markov`). Returns the raw acceptance **logit**; the sigmoid + STS
+/// temperature are applied by the verify scheduler (C2/C3), matching the
+/// reference `AcceptRatePredictor.forward` (`proj(features).squeeze(-1)`).
+/// Checkpoint keys: `confidence_head.proj.{weight,bias}`.
+final class Qwen3DSparkConfidenceHead: Module {
+    @ModuleInfo(key: "proj") var proj: Linear
+
+    init(inputDim: Int) {
+        _proj.wrappedValue = Linear(inputDim, 1)
+    }
+
+    /// `features` `[B, inputDim]` → acceptance logit `[B]`.
+    func callAsFunction(_ features: MLXArray) -> MLXArray {
+        proj(features).squeezed(axis: -1)
+    }
+}
+
 // MARK: - DSpark drafter backbone + heads
 
 public final class Qwen3DSparkModel: Module {
@@ -225,6 +263,7 @@ public final class Qwen3DSparkModel: Module {
     @ModuleInfo(key: "norm") var norm: RMSNorm
     @ModuleInfo(key: "lm_head") var lmHead: Linear
     @ModuleInfo(key: "markov_head") var markovHead: Qwen3DSparkMarkovHead
+    @ModuleInfo(key: "confidence_head") var confidenceHead: Qwen3DSparkConfidenceHead?
 
     public init(_ c: Qwen3DSparkConfiguration) {
         self.config = c
@@ -236,6 +275,21 @@ public final class Qwen3DSparkModel: Module {
         _norm.wrappedValue = RMSNorm(dimensions: c.hiddenSize, eps: c.rmsNormEps)
         _lmHead.wrappedValue = Linear(c.hiddenSize, c.vocabSize, bias: false)
         _markovHead.wrappedValue = Qwen3DSparkMarkovHead(c)
+        if c.enableConfidenceHead {
+            _confidenceHead.wrappedValue = Qwen3DSparkConfidenceHead(inputDim: c.confidenceInputDim)
+        }
+    }
+
+    /// Per-position acceptance **logit** for the confidence head (Eq. 7): feature
+    /// is `[hidden ; markov_w1[prev]]` (or `hidden` alone when not with-markov).
+    /// `hidden` `[B, H]`, `prev` `[B]` → logit `[B]`. `nil` if no confidence head.
+    public func confidenceLogit(hidden: MLXArray, prev: MLXArray) -> MLXArray? {
+        guard let confidenceHead else { return nil }
+        let features =
+            config.confidenceHeadWithMarkov
+            ? concatenated([hidden, markovHead.w1(prev)], axis: -1)
+            : hidden
+        return confidenceHead(features)
     }
 
     /// Context fusion (Eq. 2): `H_ctx = hidden_norm(fc(concat[target hiddens]))`.
@@ -261,11 +315,12 @@ public final class Qwen3DSparkModel: Module {
 
     public func logits(_ h: MLXArray) -> MLXArray { lmHead(h) }
 
-    /// Drop checkpoint weights for components this v1 doesn't model — the
-    /// confidence head (deferred; fixed-length verify is lossless). Keeps
-    /// `update(verify: [.all])` from failing on unmodeled keys.
+    /// Keep the confidence-head weights when the head is modeled
+    /// (`enable_confidence_head`); otherwise drop them so `update(verify: [.all])`
+    /// doesn't fail on the unmodeled keys.
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        weights.filter { !$0.key.hasPrefix("confidence_head") }
+        if confidenceHead != nil { return weights }
+        return weights.filter { !$0.key.hasPrefix("confidence_head") }
     }
 
     /// Sequential greedy Markov sampling (temp 0) over a block of `base` logits

@@ -47,6 +47,14 @@ public struct Gemma4DSparkConfiguration: Sendable {
     public var blockSize: Int
     public var markovRank: Int
     public var maskTokenId: Int
+    public var enableConfidenceHead: Bool
+    public var confidenceHeadWithMarkov: Bool
+
+    /// Input width of the confidence head's `proj`: the backbone hidden, plus the
+    /// Markov prev-token embedding when `confidence_head_with_markov`.
+    public var confidenceInputDim: Int {
+        hiddenSize + (confidenceHeadWithMarkov ? markovRank : 0)
+    }
 
     /// The drafter's attention head dim. The reference uses
     /// `head_dim = global_head_dim` unconditionally (gemma4/modeling.py:40).
@@ -64,7 +72,8 @@ public struct Gemma4DSparkConfiguration: Sendable {
         intermediateSize: Int, rmsNormEps: Float, attentionKEqV: Bool,
         finalLogitSoftcapping: Float?, ropeParameters: [String: [String: StringOrNumber]],
         maxPositionEmbeddings: Int, targetLayerIds: [Int], blockSize: Int, markovRank: Int,
-        maskTokenId: Int
+        maskTokenId: Int, enableConfidenceHead: Bool = false,
+        confidenceHeadWithMarkov: Bool = false
     ) {
         self.hiddenSize = hiddenSize
         self.vocabSize = vocabSize
@@ -84,6 +93,8 @@ public struct Gemma4DSparkConfiguration: Sendable {
         self.blockSize = blockSize
         self.markovRank = markovRank
         self.maskTokenId = maskTokenId
+        self.enableConfidenceHead = enableConfidenceHead
+        self.confidenceHeadWithMarkov = confidenceHeadWithMarkov
     }
 }
 
@@ -135,6 +146,8 @@ extension Gemma4DSparkConfiguration: Decodable {
         case blockSize = "block_size"
         case markovRank = "markov_rank"
         case maskTokenId = "mask_token_id"
+        case enableConfidenceHead = "enable_confidence_head"
+        case confidenceHeadWithMarkov = "confidence_head_with_markov"
     }
 
     public init(from decoder: any Swift.Decoder) throws {
@@ -167,7 +180,11 @@ extension Gemma4DSparkConfiguration: Decodable {
             targetLayerIds: try c.decode([Int].self, forKey: .targetLayerIds),
             blockSize: try c.decode(Int.self, forKey: .blockSize),
             markovRank: try c.decode(Int.self, forKey: .markovRank),
-            maskTokenId: try c.decode(Int.self, forKey: .maskTokenId)
+            maskTokenId: try c.decode(Int.self, forKey: .maskTokenId),
+            enableConfidenceHead: try c.decodeIfPresent(
+                Bool.self, forKey: .enableConfidenceHead) ?? false,
+            confidenceHeadWithMarkov: try c.decodeIfPresent(
+                Bool.self, forKey: .confidenceHeadWithMarkov) ?? false
         )
     }
 }
@@ -322,6 +339,26 @@ final class Gemma4DSparkMarkovHead: Module {
     func bias(_ prev: MLXArray) -> MLXArray { w2(w1(prev)) }
 }
 
+// MARK: - Confidence head (Eq. 7 — per-position acceptance estimator)
+
+/// DSpark `AcceptRatePredictor`: a single `Linear(inputDim → 1)` over the
+/// per-position feature `[hidden ; markov_w1[prev]]` (or just `hidden` when not
+/// `with_markov`). Returns the raw acceptance **logit** (sigmoid + STS applied by
+/// the verify scheduler, C2/C3), matching the reference
+/// `AcceptRatePredictor.forward`. Checkpoint keys: `confidence_head.proj.{weight,bias}`.
+final class Gemma4DSparkConfidenceHead: Module {
+    @ModuleInfo(key: "proj") var proj: Linear
+
+    init(inputDim: Int) {
+        _proj.wrappedValue = Linear(inputDim, 1)
+    }
+
+    /// `features` `[B, inputDim]` → acceptance logit `[B]`.
+    func callAsFunction(_ features: MLXArray) -> MLXArray {
+        proj(features).squeezed(axis: -1)
+    }
+}
+
 // MARK: - DSpark drafter backbone + heads
 
 public final class Gemma4DSparkModel: Module {
@@ -335,6 +372,7 @@ public final class Gemma4DSparkModel: Module {
     @ModuleInfo(key: "norm") var norm: Gemma4RMSNormZeroShift
     @ModuleInfo(key: "lm_head") var lmHead: Linear
     @ModuleInfo(key: "markov_head") var markovHead: Gemma4DSparkMarkovHead
+    @ModuleInfo(key: "confidence_head") var confidenceHead: Gemma4DSparkConfidenceHead?
 
     public init(_ c: Gemma4DSparkConfiguration) {
         self.config = c
@@ -348,6 +386,21 @@ public final class Gemma4DSparkModel: Module {
         _norm.wrappedValue = Gemma4RMSNormZeroShift(dimensions: c.hiddenSize, eps: c.rmsNormEps)
         _lmHead.wrappedValue = Linear(c.hiddenSize, c.vocabSize, bias: false)
         _markovHead.wrappedValue = Gemma4DSparkMarkovHead(c)
+        if c.enableConfidenceHead {
+            _confidenceHead.wrappedValue = Gemma4DSparkConfidenceHead(inputDim: c.confidenceInputDim)
+        }
+    }
+
+    /// Per-position acceptance **logit** for the confidence head (Eq. 7): feature
+    /// is `[hidden ; markov_w1[prev]]` (or `hidden` alone when not with-markov).
+    /// `hidden` `[B, H]`, `prev` `[B]` → logit `[B]`. `nil` if no confidence head.
+    public func confidenceLogit(hidden: MLXArray, prev: MLXArray) -> MLXArray? {
+        guard let confidenceHead else { return nil }
+        let features =
+            config.confidenceHeadWithMarkov
+            ? concatenated([hidden, markovHead.w1(prev)], axis: -1)
+            : hidden
+        return confidenceHead(features)
     }
 
     /// Context fusion (Eq. 2): `H_ctx = hidden_norm(fc(concat[target hiddens]))`.
@@ -379,11 +432,12 @@ public final class Gemma4DSparkModel: Module {
         return tanh(raw / cap) * cap
     }
 
-    /// Drop checkpoint weights for components this v1 doesn't model — the
-    /// confidence head (deferred; fixed-length verify is lossless). Keeps
-    /// `update(verify: [.all])` from failing on unmodeled keys.
+    /// Keep the confidence-head weights when the head is modeled
+    /// (`enable_confidence_head`); otherwise drop them so `update(verify: [.all])`
+    /// doesn't fail on the unmodeled keys.
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        weights.filter { !$0.key.hasPrefix("confidence_head") }
+        if confidenceHead != nil { return weights }
+        return weights.filter { !$0.key.hasPrefix("confidence_head") }
     }
 
     /// Sequential greedy Markov sampling (temp 0) over a block of `base` logits
