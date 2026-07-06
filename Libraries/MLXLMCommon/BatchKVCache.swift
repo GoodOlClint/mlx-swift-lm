@@ -97,6 +97,14 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         set { _idx = newValue }
     }
 
+    /// Per-row RoPE offset. MUST be declared on the concrete class: `ropeOffset`
+    /// is a `KVCache` protocol requirement whose default witness is the `KVCache`
+    /// extension's `.scalar(offset)`. The `BatchPositionedKVCache` extension's
+    /// `.batch(batchOffset)` does NOT override that base witness, so a model
+    /// holding this as a `KVCache` would otherwise get the scalar `_idx` for all
+    /// rows and ignore per-row padding (mlx-tracker #9).
+    public override var ropeOffset: RoPEOffset { .batch(batchOffset + 0) }
+
     public override var maxSize: Int? { nil }
     public override var isTrimmable: Bool { true }
 
@@ -520,6 +528,10 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
         get { _idx }
         set { _idx = newValue }
     }
+
+    /// Per-row RoPE offset (see BatchKVCache.ropeOffset for why this must be
+    /// declared on the concrete class — mlx-tracker #9).
+    public override var ropeOffset: RoPEOffset { .batch(batchOffset + 0) }
 
     public func filterBatched(batchIndices: MLXArray) {
         filter(batchIndices: batchIndices)

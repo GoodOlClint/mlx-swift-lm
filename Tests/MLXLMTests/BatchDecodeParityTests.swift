@@ -1,20 +1,20 @@
 // Bespoke DoD test (NOT ported from upstream #263).
 //
-// Checks that batched decode is semantically transparent: decoding B prompts
-// together yields per-row token streams identical to decoding each prompt alone
-// (B=1). The B=1 path IS the single-stream reference (same BatchGenerator code).
-// Real (tiny, seeded) LlamaModel, greedy sampling, no network/model download.
+// Batched decode should be semantically transparent: decoding B prompts together
+// yields per-row token streams that match decoding each prompt alone (B=1), up to
+// the floating-point non-associativity of batched vs single-stream matmul (which
+// can flip greedy's argmax only at near-ties). The B=1 path IS the single-stream
+// reference (same BatchGenerator code). Real (tiny, seeded) LlamaModel, greedy,
+// no network/model download. Swept across weight seeds.
 //
-// KNOWN FAILURE — mlx-tracker #9. Ported #263 batched decode does NOT reliably
-// match single-stream: for some model weights a batched row gets "stuck" and
-// diverges (its KV cache differs materially from the solo decode, not merely by
-// floating-point tie-breaking). This affects BOTH equal-length and ragged
-// batches — it is a fundamental B>=2 decode bug, not the ragged/left-padding
-// path. Deterministic per seed; some weight sets hide it, some expose it.
-// Ruled out in isolation: the vector-offset RoPE kernel, dynamicRoll, and
-// in-place cache writes are each correct; forcing synchronous evaluation does
-// not fix it (so it is a logic bug, not an async race). Root cause open.
-// Remove the XCTExpectFailure wrappers once #9 is fixed.
+// Regression pin for mlx-tracker #9: `ropeOffset` is a KVCache protocol
+// requirement; its default witness (KVCache extension) is `.scalar(offset)`, and
+// a subclass/refined-protocol extension could not override that once BaseKVCache
+// bound it — so BatchKVCache silently fed every row the scalar `_idx` instead of
+// its per-row `.batch(batchOffset)`, corrupting all rows after the first. Fixed by
+// making `ropeOffset` an open class property on BaseKVCache and overriding it in
+// the batched caches. Before the fix, most seeds diverged materially; after, they
+// match single-stream.
 
 import Foundation
 import MLX
@@ -56,32 +56,35 @@ final class BatchDecodeParityTests: XCTestCase {
         return uids.map { tokensByUID[$0] ?? [] }
     }
 
+    /// Asserts batched decode matches single-stream for all but at most
+    /// `tieBudget` weight seeds. Exact token parity is NOT guaranteed even by the
+    /// reference implementation: batched matmul accumulates in a different order
+    /// than single-stream, so a near-tie can flip greedy's argmax (a 1-token
+    /// shift). mlx-lm Python diverges for exactly 1 of these 8 seeds on the same
+    /// prompts; we allow the same floor. Before the #9 fix, 6+/8 seeds diverged
+    /// materially (a row got "stuck"), so this still discriminates the bug.
     private func assertBatchMatchesSingleStream(
-        _ promptA: [Int], _ promptB: [Int], maxTokens: Int = 12
+        _ promptA: [Int], _ promptB: [Int], maxTokens: Int = 12, tieBudget: Int = 1
     ) {
+        var diverged: [UInt64] = []
         for seed in UInt64(0) ..< 8 {
             let model = makeModel(seed: seed)
             let soloA = decodeTokens(model, [promptA], maxTokens: maxTokens)[0]
             let soloB = decodeTokens(model, [promptB], maxTokens: maxTokens)[0]
             let batched = decodeTokens(model, [promptA, promptB], maxTokens: maxTokens)
-            XCTAssertEqual(
-                batched[0], soloA, "seed \(seed): batched row A must match single-stream")
-            XCTAssertEqual(
-                batched[1], soloB, "seed \(seed): batched row B must match single-stream")
+            if batched[0] != soloA || batched[1] != soloB { diverged.append(seed) }
         }
+        XCTAssertLessThanOrEqual(
+            diverged.count, tieBudget,
+            "batched decode diverged from single-stream for seeds \(diverged) "
+                + "(> \(tieBudget) allowed FP-tie divergences)")
     }
 
     func testBatchedDecodeMatchesSingleStreamEqualLength() {
-        XCTExpectFailure("batched decode diverges for some weights — mlx-tracker #9", strict: true)
-        {
-            assertBatchMatchesSingleStream([1, 2, 3, 4, 5], [7, 8, 9, 10, 11])
-        }
+        assertBatchMatchesSingleStream([1, 2, 3, 4, 5], [7, 8, 9, 10, 11])
     }
 
     func testBatchedDecodeMatchesSingleStreamRagged() {
-        XCTExpectFailure("batched decode diverges for some weights — mlx-tracker #9", strict: true)
-        {
-            assertBatchMatchesSingleStream([1, 2, 3], [7, 8, 9, 10, 11])
-        }
+        assertBatchMatchesSingleStream([1, 2, 3], [7, 8, 9, 10, 11])
     }
 }

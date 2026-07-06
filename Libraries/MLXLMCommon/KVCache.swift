@@ -174,6 +174,13 @@ open class BaseKVCache: KVCache {
     public var offset: Int = 0
     public var maxSize: Int? { nil }
 
+    /// RoPE offset for this cache. Declared as an `open` class property (not left
+    /// to the `KVCache` extension default) so subclasses can override it with
+    /// dynamic dispatch — e.g. batched caches return a per-row `.batch(...)`.
+    /// A protocol-extension default cannot be overridden by a subclass once the
+    /// superclass has bound it as the witness (mlx-tracker #9).
+    open var ropeOffset: RoPEOffset { .scalar(offset) }
+
     public func innerState() -> [MLXArray] { [] }
 
     open func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
