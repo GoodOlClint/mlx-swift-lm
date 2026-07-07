@@ -614,7 +614,9 @@ public final class ChatSession {
                     var draftKVCache: [KVCache]?
                     switch cache {
                     case .empty:
-                        kvCache = model.newCache(parameters: generateParameters)
+                        kvCache = applyKVScheme(
+                            model.newCache(parameters: generateParameters),
+                            parameters: generateParameters)
                         cache = .kvcache(kvCache, draftKVCache: nil)
 
                     case .kvcache(let array, let storedDraftCache):
@@ -623,7 +625,9 @@ public final class ChatSession {
 
                     case .history(let history):
                         // the KVCache is represented by a chat history
-                        kvCache = model.newCache(parameters: generateParameters)
+                        kvCache = applyKVScheme(
+                            model.newCache(parameters: generateParameters),
+                            parameters: generateParameters)
                         cache = .kvcache(kvCache, draftKVCache: nil)
                         messages.append(contentsOf: history)
                     }
