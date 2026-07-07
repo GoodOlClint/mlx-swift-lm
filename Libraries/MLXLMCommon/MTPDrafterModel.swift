@@ -131,6 +131,21 @@ public let mtpSharedKVStatesKey =
 /// reads as `false` (no emit), so non-MTP callers are unaffected.
 public let mtpEmitFlagKey = LMOutput.Key<Bool>("mtp.emitDrafterState")
 
+/// A DSpark-style drafter sets this key (alongside ``mtpEmitFlagKey``) to ask
+/// the target to capture hidden states at these decoder-layer indices and
+/// emit them via ``mtpLayerHiddenStatesKey``. Absent ⇒ no multi-layer capture,
+/// so existing single-hidden drafters (Qwen3.5 MTP, Gemma 4 assistant) are
+/// unaffected — they never set this key and the target never does the work.
+public let mtpCaptureLayersKey = LMOutput.Key<[Int]>("mtp.captureLayers")
+
+/// Target writes the post-block hidden state of each layer index requested via
+/// ``mtpCaptureLayersKey`` here, keyed by that layer index. Feeds DSpark's
+/// multi-layer context injection (DSpark paper Eq. 2/3:
+/// `H_ctx = RMSNorm(W_c·[H^{l₁};…;H^{lₘ}])`). The captured hiddens are the
+/// residual-stream output of the layer (pre-final-norm).
+public let mtpLayerHiddenStatesKey =
+    LMOutput.Key<[Int: MLXArray]>("mtp.layerHiddenStates")
+
 // MARK: - Iterator stats surface
 
 /// Introspection surface for token iterators that perform MTP speculative

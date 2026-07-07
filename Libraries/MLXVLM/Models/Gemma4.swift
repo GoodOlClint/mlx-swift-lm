@@ -1182,8 +1182,9 @@ final class Gemma4TextBackbone: Module {
         cache: [KVCache?]? = nil,
         perLayerInputs: MLXArray? = nil,
         tokenTypeIds: MLXArray? = nil,
-        emitDrafterState: Bool = false
-    ) -> (hidden: MLXArray, sharedKV: [String: (MLXArray, MLXArray)]?) {
+        emitDrafterState: Bool = false,
+        captureLayers: Set<Int>? = nil
+    ) -> (hidden: MLXArray, sharedKV: [String: (MLXArray, MLXArray)]?, captured: [Int: MLXArray]) {
         // Tolerate callers that hand us a 1D `(L,)` token array instead
         // of the canonical 2D `(B, L)` produced by `Gemma4Processor.prepare`.
         // The downstream `perLayerInputs` indexing path (`finalPerLayerInputs[
@@ -1282,6 +1283,10 @@ final class Gemma4TextBackbone: Module {
         var h = h0
         var intermediates = [(kv: Gemma4SharedKVState?, offset: Int?)](
             repeating: (nil, nil), count: config.hiddenLayers)
+        // DSpark multi-layer context capture: post-block residual hidden at each
+        // requested layer index (HF `hidden_states[l+1]`). Empty unless requested;
+        // the default path is unchanged.
+        var captured: [Int: MLXArray] = [:]
         for (idx, layer) in layers.enumerated() {
             let sourceIdx = layerIdxToCacheIdx[idx]
             let layerCache: KVCache? =
@@ -1314,11 +1319,14 @@ final class Gemma4TextBackbone: Module {
             )
             h = output
             intermediates[idx] = (kvState, attentionOffset)
+            if captureLayers?.contains(idx) == true {
+                captured[idx] = h
+            }
         }
         let finalHidden = norm(h)
 
         guard emitDrafterState else {
-            return (finalHidden, nil)
+            return (finalHidden, nil, captured)
         }
 
         // Walk intermediates from the last layer backward; for each unique
@@ -1342,7 +1350,7 @@ final class Gemma4TextBackbone: Module {
         }
         // Treat partial coverage (e.g. only one layer_type populated, or
         // quantized cache for the other) as no-emit — iterator falls back.
-        return (finalHidden, seenTypes == targetTypes ? sharedKV : nil)
+        return (finalHidden, seenTypes == targetTypes ? sharedKV : nil, captured)
     }
 }
 
@@ -1396,13 +1404,15 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         perLayerInputs: MLXArray? = nil,
         tokenTypeIds: MLXArray? = nil,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
-        emitDrafterState: Bool = false
+        emitDrafterState: Bool = false,
+        captureLayers: Set<Int>? = nil
     ) -> LMOutput {
-        let (hidden, sharedKV) = model(
+        let (hidden, sharedKV, captured) = model(
             inputs, inputsEmbeds: inputsEmbeds, mask: mask, cache: cache?.map { $0 as KVCache? },
             perLayerInputs: perLayerInputs,
             tokenTypeIds: tokenTypeIds,
-            emitDrafterState: emitDrafterState
+            emitDrafterState: emitDrafterState,
+            captureLayers: captureLayers
         )
         let logits: MLXArray
         if let lmHead {
@@ -1418,12 +1428,17 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
             softcappedLogits = logits
         }
 
-        guard emitDrafterState, let sharedKV else {
+        // Emit drafter state for either seam that was requested: the MTP shared
+        // K/V (Gemma4Assistant) and/or the DSpark multi-layer hiddens. Default
+        // path (neither requested) stays byte-identical.
+        let emitSharedKV = emitDrafterState && sharedKV != nil
+        guard emitSharedKV || !captured.isEmpty else {
             return LMOutput(logits: softcappedLogits)
         }
         var state = LMOutput.State()
         state[mtpLastHiddenStatesKey] = hidden
-        state[mtpSharedKVStatesKey] = sharedKV
+        if let sharedKV { state[mtpSharedKVStatesKey] = sharedKV }
+        if !captured.isEmpty { state[mtpLayerHiddenStatesKey] = captured }
         return LMOutput(logits: softcappedLogits, state: state)
     }
 
@@ -2099,9 +2114,11 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
         let emit = state?[mtpEmitFlagKey] ?? false
+        let captureLayers = state?[mtpCaptureLayersKey]
         return languageModel(
             input.tokens, cache: cache?.map { $0 },
-            emitDrafterState: emit
+            emitDrafterState: emit,
+            captureLayers: captureLayers.map { Set($0) }
         )
     }
 
@@ -2555,6 +2572,32 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider {
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
         let logits = languageModel(inputs, cache: cache?.map { $0 })
         return logits.logits
+    }
+
+    /// DSpark-aware `LanguageModel` entry. When a DSpark drafter requests
+    /// `mtpCaptureLayersKey`, the returned `LMOutput` carries
+    /// `mtpLayerHiddenStatesKey` (post-block hiddens at those layers) and
+    /// `mtpLastHiddenStatesKey`. Without the capture request this is
+    /// bit-identical to the default text path. Overrides the protocol-extension
+    /// default (which would discard `state`).
+    ///
+    /// Note: the MTP shared-K/V seam (`mtpEmitFlagKey`) is intentionally NOT
+    /// threaded here. `Gemma4AssistantDraftModel.draftBlock` only accepts the
+    /// non-unified `Gemma4` target, so emitting shared K/V for a unified target
+    /// would drive the MTP iterator into a `fatalError`. Leaving it unset keeps
+    /// MTP-on-unified as a graceful single-token passthrough. (Enabling unified
+    /// MTP needs the assistant to accept `Gemma4Unified` — separate work.)
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        let emit = state?[mtpEmitFlagKey] ?? false
+        let captureLayers = state?[mtpCaptureLayersKey]
+        guard emit, let captureLayers, !captureLayers.isEmpty else {
+            return LMOutput(logits: callAsFunction(input.tokens, cache: cache))
+        }
+        return languageModel(
+            input.tokens, cache: cache?.map { $0 },
+            captureLayers: Set(captureLayers))
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
