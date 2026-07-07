@@ -1605,6 +1605,7 @@ private func cacheClassName(_ cache: KVCache) -> String {
     case is ArraysCache: return "ArraysCache"
     case is RotatingKVCache: return "RotatingKVCache"
     case is QuantizedKVCache: return "QuantizedKVCache"
+    case is TriAttentionKVCache: return "TriAttentionKVCache"
     case is KVCacheSimple: return "KVCache"
     case is CacheList: return "CacheList"
     default: return "KVCache"
@@ -1760,6 +1761,9 @@ private func restoreCacheFromMetaState(
 
     case "CacheList":
         return try CacheList.fromState(state: state, metaState: metaState)
+
+    case "TriAttentionKVCache":
+        return try TriAttentionKVCache.fromState(state: state, metaState: metaState)
 
     default:
         throw KVCacheError(message: "Unknown cache class: \(className)")
@@ -2011,6 +2015,52 @@ public func resolveAffineScheme(_ scheme: String?) -> (bits: Int, groupSize: Int
     case "affine8": return (8, 64)
     default: return nil
     }
+}
+
+/// Parse a TriAttention kvScheme: "triattention" (defaults) or
+/// "triattention:kvBudget=4096,divideLength=128,agg=mean,pin=true".
+/// Returns nil for non-TriAttention schemes. Malformed key/value pairs are
+/// ignored, keeping scheme parsing forgiving like ``resolveAffineScheme``.
+public func resolveTriAttentionScheme(_ scheme: String?) -> TriAttentionConfig? {
+    guard let scheme else { return nil }
+    let parts = scheme.split(separator: ":", maxSplits: 1)
+    guard parts.first == "triattention" else { return nil }
+
+    var config = TriAttentionConfig()
+    if parts.count == 2 {
+        for pair in parts[1].split(separator: ",") {
+            let kv = pair.split(separator: "=", maxSplits: 1)
+            guard kv.count == 2 else { continue }
+            let key = String(kv[0])
+            let value = String(kv[1])
+            switch key {
+            case "kvBudget":
+                if let v = Int(value) { config.kvBudget = v }
+            case "divideLength":
+                if let v = Int(value) { config.divideLength = v }
+            case "agg":
+                if let v = TriAttentionConfig.ScoreAggregation(rawValue: value) {
+                    config.scoreAggregation = v
+                }
+            case "pin":
+                if let v = Bool(value) { config.prefillPin = v }
+            default:
+                continue
+            }
+        }
+    }
+    return config
+}
+
+/// Resolve a custom kvScheme on a freshly created cache array.
+/// A TriAttention scheme swaps each plain ``KVCacheSimple`` for a
+/// self-evicting ``TriAttentionKVCache``; other layers (Mamba/rotating/
+/// quantized) are untouched. Deliberately NOT applied on the batch, draft,
+/// or MTP/speculative paths — those are eviction-inert by design (they pass
+/// `parameters: nil` or never set a scheme).
+public func applyKVScheme(_ cache: [KVCache], parameters: GenerateParameters?) -> [KVCache] {
+    guard let config = resolveTriAttentionScheme(parameters?.kvScheme) else { return cache }
+    return cache.map { $0 is KVCacheSimple ? TriAttentionKVCache(config: config) : $0 }
 }
 
 /// Converts regular caches to quantized caches when:
