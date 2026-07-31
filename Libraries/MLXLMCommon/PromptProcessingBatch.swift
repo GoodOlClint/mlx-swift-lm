@@ -114,9 +114,14 @@ public final class PromptProcessingBatch: @unchecked Sendable {
         while remaining.dim(1) > 0 {
             let n = min(prefillStepSize, remaining.dim(1))
             let chunk = remaining[0..., ..<n]
-            _ = model.callAsFunction(
-                chunk,
-                cache: promptCache.map { $0 as any KVCache }
+            // Route through the LMInput.Text overload, not the bare
+            // callAsFunction(inputs:cache:) — the latter fatal-aborts for
+            // any VLM (tracker #19). See GenerationBatch.step for the full
+            // rationale.
+            _ = model(
+                LMInput.Text(tokens: chunk),
+                cache: promptCache.map { $0 as any KVCache },
+                state: nil
             )
             for cache in promptCache {
                 eval(cache.innerState())

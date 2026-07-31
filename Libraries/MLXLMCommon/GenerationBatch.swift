@@ -221,7 +221,17 @@ public final class GenerationBatch: @unchecked Sendable {
         let currentTokens = nextTokens
         let inputs = currentTokens[0..., .newAxis]
 
-        let logits = model.callAsFunction(inputs, cache: promptCache.map { $0 as any KVCache })
+        // Route through the LMInput.Text overload rather than the bare
+        // callAsFunction(inputs:cache:). Every model implements the text
+        // overload — LLM text models via the LanguageModel default (which
+        // delegates to the bare forward), VLMs via their own override that
+        // reaches the language model. Calling the bare forward directly
+        // fatal-aborts for any VLM, which never implements it (tracker #19).
+        let logits = model(
+            LMInput.Text(tokens: inputs),
+            cache: promptCache.map { $0 as any KVCache },
+            state: nil
+        ).logits
 
         // [B, 1, vocab] -> [B, vocab]
         let stepLogits = logits[.ellipsis, -1, 0...]
