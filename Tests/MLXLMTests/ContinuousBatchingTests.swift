@@ -261,7 +261,9 @@ private final class IncrementingLanguageModel: Module, LanguageModel, KVCacheDim
     let vocabularySize = 16
     var kvHeads: [Int] { [1] }
 
-    func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws -> PrepareResult {
+    func prepare(
+        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, windowSize: Int?
+    ) throws -> PrepareResult {
         .tokens(input.text)
     }
 
