@@ -720,7 +720,9 @@ public final class ChatSession {
                     var conversation: Conversation?
                     switch cache {
                     case .empty:
-                        kvCache = model.newCache(parameters: generateParameters)
+                        kvCache = applyKVScheme(
+                            model.newCache(parameters: generateParameters),
+                            parameters: generateParameters)
                         conversation = Conversation(messages: [], cachedTokens: [])
                         cache = .kvcache(
                             kvCache, draftKVCache: nil, state: nil, conversation: conversation)
@@ -736,7 +738,9 @@ public final class ChatSession {
 
                     case .history(let history):
                         // the KVCache is represented by a chat history
-                        kvCache = model.newCache(parameters: generateParameters)
+                        kvCache = applyKVScheme(
+                            model.newCache(parameters: generateParameters),
+                            parameters: generateParameters)
                         conversation = Conversation(messages: history, cachedTokens: [])
                         cache = .kvcache(
                             kvCache, draftKVCache: nil, state: nil, conversation: conversation)

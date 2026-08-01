@@ -608,7 +608,8 @@ public struct TokenIterator: TokenIteratorProtocol {
     ) throws {
         self.model = model
         self.y = .init(tokens: prompt)
-        self.cache = cache ?? model.newCache(parameters: parameters)
+        self.cache =
+            cache ?? applyKVScheme(model.newCache(parameters: parameters), parameters: parameters)
 
         self.processor = parameters.processor()
         self.sampler = parameters.sampler()
@@ -646,7 +647,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.model = model
         self.state = state
         self.y = input.text
-        self.cache = cache ?? model.newCache(parameters: parameters)
+        self.cache =
+            cache ?? applyKVScheme(model.newCache(parameters: parameters), parameters: parameters)
 
         self.processor = parameters.processor()
         self.sampler = parameters.sampler()
