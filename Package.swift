@@ -4,6 +4,23 @@
 import CompilerPluginSupport
 import PackageDescription
 
+// fork/local-glue (fork-only, NEVER upstreamed): when MLX_LOCAL_DEV=1, build against the local
+// mlx-swift dev clone at ../mlx-swift instead of the released 0.31.4 SCM pin. This enables the
+// cross-repo dev loop (editing mlx-swift / its Cmlx submodules and rebuilding mlx-swift-lm). The
+// released pin on `main` is untouched; the override is opt-in via the environment flag only.
+let mlxSwiftDependency: Package.Dependency =
+    Context.environment["MLX_LOCAL_DEV"] == "1"
+    ? .package(name: "mlx-swift", path: "../mlx-swift")
+    : .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4"))
+
+let mlxSwiftLMDependencies: [Package.Dependency] = [
+    mlxSwiftDependency,
+    // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
+    // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
+    // source compile of swift-syntax.
+    .package(url: "https://github.com/swiftlang/swift-syntax.git", "602.0.0" ..< "604.0.0"),
+]
+
 let package = Package(
     name: "mlx-swift-lm",
     platforms: [
@@ -57,13 +74,7 @@ let package = Package(
         ),
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
-    dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
-        // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
-        // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
-        // source compile of swift-syntax.
-        .package(url: "https://github.com/swiftlang/swift-syntax.git", "602.0.0" ..< "604.0.0"),
-    ],
+    dependencies: mlxSwiftLMDependencies,
     targets: [
         .target(
             name: "MLXLLM",
